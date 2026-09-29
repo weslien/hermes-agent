@@ -2,6 +2,7 @@ import { MessagePrimitive, useAuiState } from '@assistant-ui/react'
 import { type FC, useState } from 'react'
 
 import { MarkdownTextContent } from '@/components/assistant-ui/markdown-text'
+import { TranscriptDirectiveLeaf } from '@/components/assistant-ui/transcript-directive'
 import { messageContentText } from '@/components/assistant-ui/thread/content'
 import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
 import { SCAFFOLD_GLYPH_CLASS, SCAFFOLD_LABEL_CLASS, ScaffoldRow } from '@/components/chat/scaffold-row'
@@ -138,6 +139,27 @@ export const SystemMessage: FC = () => {
     // multiline output (catalogs, usage tables) needs left-aligned, wider room
     // or the column alignment breaks.
     const multiline = output.includes('\n')
+
+    // A slash command (e.g. /memory review) can emit a `::preview{file=…}`
+    // directive among its output lines. Render those lines LIVE through the
+    // transcript directive registry — the same path assistant prose takes —
+    // and the remaining lines as regular text. Unclaimed names stay text.
+    const directiveLines = output.split('\n').filter(line => line.trim().startsWith('::'))
+
+    if (directiveLines.length > 0) {
+      return (
+        <MessagePrimitive.Root
+          className="w-full min-w-0 self-start px-2 py-1"
+          data-role="system"
+          data-slot="aui_system-message-root"
+        >
+          <span className="font-mono text-[0.6875rem] text-muted-foreground/55">{slashStatus.groups.command}</span>
+          {directiveLines.map(line => (
+            <TranscriptDirectiveLeaf key={line} streaming={false} text={line.trim()} />
+          ))}
+        </MessagePrimitive.Root>
+      )
+    }
 
     return (
       <MessagePrimitive.Root

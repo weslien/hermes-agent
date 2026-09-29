@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Memory Approvals</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: var(--app-font, system-ui, sans-serif);
+    background: transparent;
+    color: var(--foreground);
+    font-size: 13px;
+    line-height: 1.5;
+    padding: 12px;
+  }
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 12px; gap: 12px;
+  }
+  .header h1 { font-size: 16px; font-weight: 600; }
+  .stats { display: flex; gap: 8px; font-size: 12px; color: var(--muted-foreground); }
+  .badge { padding: 2px 8px; border-radius: 4px; border: 1px solid var(--border); }
+  .bulk-bar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  .btn {
+    padding: 4px 12px; border-radius: 4px; border: 1px solid var(--border);
+    background: transparent; color: var(--foreground); cursor: pointer;
+    font-size: 12px; font-family: inherit; transition: all 0.15s;
+  }
+  .btn:hover { border-color: var(--accent); }
+  .btn-approve { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
+  .btn-approve:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .btn-reject { color: #ef4444; border-color: color-mix(in srgb, #ef4444 40%, var(--border)); }
+  .btn-reject:hover { background: color-mix(in srgb, #ef4444 12%, transparent); }
+  .filter-row { display: flex; gap: 6px; margin-bottom: 10px; align-items: center; flex-wrap: wrap; }
+  .filter-btn {
+    padding: 2px 10px; border-radius: 4px; border: 1px solid var(--border);
+    background: transparent; color: var(--muted-foreground); cursor: pointer;
+    font-size: 11px; font-family: inherit;
+  }
+  .filter-btn.active { color: var(--accent); border-color: var(--accent); }
+  .search {
+    flex: 1; min-width: 120px; padding: 3px 8px; border-radius: 4px;
+    border: 1px solid var(--border); background: transparent; color: var(--foreground);
+    font-size: 12px; font-family: inherit;
+  }
+  .search:focus { outline: none; border-color: var(--accent); }
+  .card {
+    border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px;
+    margin-bottom: 8px; background: var(--card); transition: opacity 0.2s;
+  }
+  .card.approved { opacity: 0.4; }
+  .card.rejected { opacity: 0.3; }
+  .card-top { display: flex; align-items: flex-start; gap: 8px; justify-content: space-between; }
+  .card-info { flex: 1; min-width: 0; }
+  .card-id { font-family: var(--app-font-mono, monospace); font-size: 11px; color: var(--muted-foreground); }
+  .card-meta { font-size: 11px; color: var(--muted-foreground); margin-top: 2px; display: flex; gap: 8px; }
+  .tag { padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 500; }
+  .tag-memory { background: color-mix(in srgb, var(--accent) 15%, transparent); color: var(--accent); }
+  .tag-user { background: color-mix(in srgb, var(--foreground) 12%, transparent); color: var(--foreground); }
+  .tag-auto { background: color-mix(in srgb, #f59e0b 15%, transparent); color: #f59e0b; }
+  .card-summary { margin-top: 6px; font-size: 12px; word-break: break-word; }
+  .ops-list { margin-top: 8px; border-left: 2px solid var(--border); padding-left: 8px; }
+  .op { margin-bottom: 4px; font-size: 11px; color: var(--muted-foreground); }
+  .op-action { font-weight: 600; text-transform: uppercase; font-size: 10px; }
+  .op-remove .op-action { color: #ef4444; }
+  .op-replace .op-action { color: #f59e0b; }
+  .op-add .op-action { color: var(--accent); }
+  .op-old { text-decoration: line-through; opacity: 0.6; }
+  .op-new { color: var(--foreground); }
+  .card-actions { display: flex; gap: 6px; flex-shrink: 0; }
+  .card-btn {
+    padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border);
+    cursor: pointer; font-size: 11px; font-family: inherit; font-weight: 500; background: transparent;
+  }
+  .card-btn.approve { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
+  .card-btn.approve:hover { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .card-btn.reject { color: #ef4444; border-color: color-mix(in srgb, #ef4444 40%, var(--border)); }
+  .card-btn.reject:hover { background: color-mix(in srgb, #ef4444 12%, transparent); }
+  .status-msg { font-size: 11px; margin-top: 4px; font-weight: 500; }
+  .status-msg.ok { color: var(--accent); }
+  .status-msg.err { color: #ef4444; }
+  .empty { text-align: center; color: var(--muted-foreground); padding: 40px 0; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>__TITLE__</h1>
+  <div class="stats">
+    <span class="badge" id="count-pending">—</span>
+    <span class="badge" id="count-done">0 done</span>
+  </div>
+</div>
+<div class="bulk-bar">
+  <button class="btn btn-approve" onclick="approveAll()">✓ Approve All</button>
+  <button class="btn btn-reject" onclick="rejectAll()">✗ Reject All</button>
+</div>
+<div class="filter-row">
+  <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">All</button>
+  <button class="filter-btn" data-filter="memory" onclick="setFilter('memory')">Memory</button>
+  <button class="filter-btn" data-filter="user" onclick="setFilter('user')">User</button>
+  <input class="search" type="text" placeholder="Search..." oninput="render()" id="search">
+</div>
+<div id="list"></div>
+<script>
+const DATA = __DATA__;
+let filter = 'all';
+let results = {};
+function init() { DATA.forEach(r => results[r.id] = 'pending'); render(); }
+function setFilter(f) {
+  filter = f;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+  document.querySelector(`[data-filter="${f}"]`).classList.add('active');
+  render();
+}
+function getVisible() {
+  const q = document.getElementById('search').value.toLowerCase();
+  return DATA.filter(r => {
+    if (filter !== 'all' && r.target !== filter) return false;
+    if (q && !r.summary.toLowerCase().includes(q) && !r.id.includes(q)) return false;
+    return true;
+  });
+}
+function render() {
+  const visible = getVisible();
+  const pending = visible.filter(r => results[r.id] === 'pending').length;
+  const done = Object.values(results).filter(v => v !== 'pending').length;
+  document.getElementById('count-pending').textContent = `${pending} pending`;
+  document.getElementById('count-done').textContent = `${done} done`;
+  const list = document.getElementById('list');
+  if (visible.length === 0) { list.innerHTML = '<div class="empty">No pending writes match.</div>'; return; }
+  list.innerHTML = visible.map(r => {
+    const state = results[r.id];
+    const stateClass = state !== 'pending' ? state : '';
+    const opsHtml = r.ops.map(op => {
+      if (op.action === 'remove')
+        return `<div class="op op-remove"><span class="op-action">remove</span> <span class="op-old">${esc(op.old)}</span></div>`;
+      if (op.action === 'replace')
+        return `<div class="op op-replace"><span class="op-action">replace</span><br><span class="op-old">${esc(op.old)}</span><br><span class="op-new">${esc(op.new)}</span></div>`;
+      if (op.action === 'add')
+        return `<div class="op op-add"><span class="op-action">add</span> <span class="op-new">${esc(op.new)}</span></div>`;
+      return `<div class="op"><span class="op-action">${op.action}</span> ${esc(op.text || '')}</div>`;
+    }).join('');
+    const actions = state === 'pending'
+      ? `<div class="card-actions"><button class="card-btn approve" onclick="act('${r.id}','approve')">✓</button><button class="card-btn reject" onclick="act('${r.id}','reject')">✗</button></div>`
+      : `<div class="card-actions"><span class="status-msg ${state === 'approved' ? 'ok' : 'err'}">${state}</span></div>`;
+    return `<div class="card ${stateClass}"><div class="card-top"><div class="card-info"><span class="card-id">${r.id}</span> <span class="tag tag-${r.target}">${r.target}</span> ${r.origin === 'background_review' ? '<span class="tag tag-auto">auto</span>' : ''}<div class="card-meta">${r.created} · ${r.ops.length} op${r.ops.length > 1 ? 's' : ''}</div></div>${actions}</div><div class="card-summary">${esc(r.summary.substring(0, 200))}${r.summary.length > 200 ? '...' : ''}</div><div class="ops-list">${opsHtml}</div></div>`;
+  }).join('');
+}
+function act(id, action) {
+  results[id] = action === 'approve' ? 'approved' : 'rejected';
+  render();
+  window.hermes.send(`/memory ${action === 'approve' ? 'approve' : 'reject'} ${id}`);
+}
+function approveAll() {
+  const visible = getVisible().filter(r => results[r.id] === 'pending');
+  if (visible.length === 0) return;
+  window.hermes.send('/memory approve all');
+  visible.forEach(r => results[r.id] = 'approved');
+  render();
+}
+function rejectAll() {
+  const visible = getVisible().filter(r => results[r.id] === 'pending');
+  if (visible.length === 0) return;
+  window.hermes.send('/memory reject all');
+  visible.forEach(r => results[r.id] = 'rejected');
+  render();
+}
+function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+init();
+</script>
+</body>
+</html>

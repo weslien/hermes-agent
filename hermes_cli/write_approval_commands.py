@@ -4,6 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
+from datetime import datetime
+from pathlib import Path
 from typing import List, Optional
 
 from tools import write_approval as wa
@@ -50,6 +54,8 @@ def handle_pending_subcommand(
         return _reject(subsystem, rest)
     if sub == "diff" and subsystem == wa.SKILLS:
         return _diff(rest)
+    if sub == "review" and subsystem == wa.MEMORY:
+        return _render_review(rest, memory_store)
     if sub in {"approval", "mode"}:  # 'mode' kept as a back-compat alias
         return _set_approval(subsystem, rest, set_mode_fn)
     return None  # not ours — caller handles
@@ -164,3 +170,77 @@ def _set_approval(subsystem: str, rest: List[str], set_mode_fn) -> str:
     except Exception as e:
         return f"Failed to set {subsystem}.write_approval: {e}"
     return f"{subsystem}.write_approval set to '{'on' if enabled else 'off'}'."
+
+
+# ── /memory review — interactive HTML widget ─────────────────────────────────
+
+_REVIEW_TEMPLATE: Optional[str] = None
+
+
+def _load_review_template() -> str:
+    """Load the HTML template, cached after first read."""
+    global _REVIEW_TEMPLATE
+    if _REVIEW_TEMPLATE is None:
+        template_path = Path(__file__).parent / "templates" / "memory_review.html"
+        _REVIEW_TEMPLATE = template_path.read_text(encoding="utf-8")
+    return _REVIEW_TEMPLATE
+
+
+def _render_review(rest: List[str], memory_store=None) -> str:
+    """Generate an interactive HTML review widget for pending memory writes.
+
+    Returns a ``::preview`` directive so the desktop app renders the widget in
+    the preview pane. Falls back to a text list if there are no pending writes.
+    """
+    records = wa.list_pending(wa.MEMORY)
+    if not records:
+        return "No pending memory writes to review."
+
+    # Build widget data
+    widget_data = []
+    for r in records:
+        payload = r.get("payload", {})
+        ops = payload.get("operations", [])
+        ops_summary = []
+        for op in ops:
+            action = op.get("action", "?")
+            old = (op.get("old_text", "") or "")[:120]
+            new = (op.get("content", op.get("new_text", "")) or "")[:120]
+            if action == "remove":
+                ops_summary.append({"action": "remove", "old": old})
+            elif action == "replace":
+                ops_summary.append({"action": "replace", "old": old, "new": new})
+            elif action == "add":
+                ops_summary.append({"action": "add", "new": new})
+            else:
+                ops_summary.append({"action": action, "text": f"{old} -> {new}"})
+
+        widget_data.append({
+            "id": r["id"],
+            "target": payload.get("target", "unknown"),
+            "summary": r.get("summary", ""),
+            "created": datetime.fromtimestamp(r.get("created_at", 0)).strftime("%b %d, %H:%M"),
+            "ops": ops_summary,
+            "origin": r.get("origin", "foreground"),
+        })
+
+    # Sort by target then date
+    widget_data.sort(key=lambda r: (r.get("target", "z"), r.get("created", "")))
+
+    data_json = json.dumps(widget_data)
+    template = _load_review_template()
+    title = f"📋 Memory Approvals ({len(widget_data)} pending)"
+    html_content = template.replace("__DATA__", data_json).replace("__TITLE__", title)
+
+    # Write to scratch dir
+    try:
+        from hermes_constants import get_hermes_home
+        scratch = Path(get_hermes_home()) / "cache" / "scratch"
+    except ImportError:
+        scratch = Path.home() / ".hermes" / "cache" / "scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+
+    html_path = scratch / f"memory-review-{os.getpid()}.html"
+    html_path.write_text(html_content, encoding="utf-8")
+
+    return f"Rendered {len(widget_data)} pending memory writes.\n\n::preview{{file=\"{html_path}\"}}"
