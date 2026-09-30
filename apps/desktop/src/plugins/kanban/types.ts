@@ -89,6 +89,10 @@ export interface KanbanAttachment {
   id: number | string
   filename: string
   size?: null | number
+  content_type?: null | string
+  uploaded_by?: null | string
+  stored_path?: string
+  created_at?: number
 }
 
 /** GET /tasks/:id `link_tasks` — one resolved row per linked task, so the UI

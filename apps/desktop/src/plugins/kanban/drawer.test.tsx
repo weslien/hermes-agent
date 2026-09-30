@@ -34,6 +34,14 @@ const rest = vi.fn(async (path: string, options?: PluginRestOptions): Promise<un
     return { ok: true }
   }
 
+  if (path.startsWith('/attachments/') && path.includes('/data-url')) {
+    return { dataUrl: 'data:text/plain;base64,Zm9v', filename: 'test.txt', contentType: 'text/plain' }
+  }
+
+  if (path.startsWith('/attachments/') && options?.method === 'DELETE') {
+    return { ok: true, id: 7 }
+  }
+
   if (path.startsWith('/tasks/t_example/comments') && options?.method === 'POST') {
     return { ok: true }
   }
@@ -130,6 +138,38 @@ describe('task attachment compatibility', () => {
     )
     expect(await screen.findByText(file.name)).toBeTruthy()
     expect(screen.queryByText(en.noAttachments)).toBeNull()
+  })
+
+  it('downloads an attachment when its filename is clicked', async () => {
+    const att = { id: 42, filename: 'report.pdf', size: 1024, content_type: 'application/pdf' }
+    detail = { ...legacyDetail, attachments: [att] }
+    openDrawer()
+
+    // Wait for the attachment to render, then click the filename.
+    const link = await screen.findByRole('button', { name: 'report.pdf' })
+    expect(link).toBeTruthy()
+    await act(() => fireEvent.click(link))
+
+    // The download mutation calls GET /attachments/{id}/data-url.
+    await waitFor(() => {
+      const calls = rest.mock.calls.map(c => c[0])
+      expect(calls).toContain('/attachments/42/data-url')
+    }, { timeout: 5000 })
+  })
+
+  it('deletes an attachment after confirm', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const att = { id: 7, filename: 'old.txt', size: 10 }
+    detail = { ...legacyDetail, attachments: [att] }
+    openDrawer()
+
+    const removeBtn = await screen.findByRole('button', { name: en.removeAttachment })
+    fireEvent.click(removeBtn)
+
+    await waitFor(() =>
+      expect(rest).toHaveBeenCalledWith('/attachments/7', { method: 'DELETE' })
+    )
+    confirmSpy.mockRestore()
   })
 })
 

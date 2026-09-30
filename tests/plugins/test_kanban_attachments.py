@@ -257,6 +257,36 @@ def test_download_unknown_attachment_404(client):
     assert client.get("/api/plugins/kanban/attachments/424242").status_code == 404
 
 
+def test_data_url_endpoint_returns_base64_envelope(client):
+    """The desktop IPC bridge JSON-parses every response, so the binary
+    FileResponse endpoint can't be used from the renderer. The /data-url
+    variant wraps the file in a JSON {dataUrl, filename, contentType} envelope."""
+    task_id = _create_task_via_api(client)
+    content = b"data-url test content"
+
+    r = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/attachments",
+        files={"file": ("doc.txt", content, "text/plain")},
+    )
+    assert r.status_code == 200, r.text
+    att_id = r.json()["attachment"]["id"]
+
+    r = client.get(f"/api/plugins/kanban/attachments/{att_id}/data-url")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["filename"] == "doc.txt"
+    assert body["contentType"] == "text/plain"
+    # The dataUrl must be a valid base64 data URL that decodes to the original.
+    assert body["dataUrl"].startswith("data:text/plain;base64,")
+    import base64
+    decoded = base64.b64decode(body["dataUrl"].split(",", 1)[1])
+    assert decoded == content
+
+
+def test_data_url_unknown_attachment_404(client):
+    assert client.get("/api/plugins/kanban/attachments/424242/data-url").status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # Shared helper — store_attachment_bytes (used by dashboard + tool + CLI)
 # ---------------------------------------------------------------------------

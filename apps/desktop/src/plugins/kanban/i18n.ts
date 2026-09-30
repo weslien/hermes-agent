@@ -153,6 +153,11 @@ type KanbanMessages = {
   attachments: (n: number) => string
   noAttachments: string
   uploadAttachment: string
+  downloadAttachment: string
+  removeAttachment: string
+  confirmRemoveAttachment: string
+  attachmentDownloadFailed: string
+  attachmentDeleted: string
   taskActions: string
   copyTaskId: string
   copyTitle: string
@@ -374,6 +379,11 @@ export const en: KanbanMessages = {
   attachments: n => `Attachments · ${n}`,
   noAttachments: 'No attachments yet.',
   uploadAttachment: 'Upload attachment',
+  downloadAttachment: 'Download',
+  removeAttachment: 'Remove attachment',
+  confirmRemoveAttachment: 'Remove this attachment?',
+  attachmentDownloadFailed: 'Could not download attachment.',
+  attachmentDeleted: 'Attachment removed.',
   taskActions: 'Task actions',
   copyTaskId: 'Copy task id',
   copyTitle: 'Copy title',
@@ -587,6 +597,11 @@ const ja: KanbanMessages = {
   attachments: n => `添付・${n}`,
   noAttachments: 'まだ添付はありません。',
   uploadAttachment: '添付をアップロード',
+  downloadAttachment: 'ダウンロード',
+  removeAttachment: '添付を削除',
+  confirmRemoveAttachment: 'この添付を削除しますか？',
+  attachmentDownloadFailed: '添付をダウンロードできませんでした。',
+  attachmentDeleted: '添付が削除されました。',
   taskActions: 'タスクの操作',
   copyTaskId: 'タスク ID をコピー',
   copyTitle: 'タイトルをコピー',
@@ -798,6 +813,11 @@ const zh: KanbanMessages = {
   attachments: n => `附件・${n}`,
   noAttachments: '暂无附件。',
   uploadAttachment: '上传附件',
+  downloadAttachment: '下载',
+  removeAttachment: '删除附件',
+  confirmRemoveAttachment: '确定删除此附件？',
+  attachmentDownloadFailed: '无法下载附件。',
+  attachmentDeleted: '附件已删除。',
   taskActions: '任务操作',
   copyTaskId: '复制任务 ID',
   copyTitle: '复制标题',
@@ -1008,6 +1028,11 @@ const zhHant: KanbanMessages = {
   attachments: n => `附件・${n}`,
   noAttachments: '尚無附件。',
   uploadAttachment: '上傳附件',
+  downloadAttachment: '下載',
+  removeAttachment: '刪除附件',
+  confirmRemoveAttachment: '確定刪除此附件？',
+  attachmentDownloadFailed: '無法下載附件。',
+  attachmentDeleted: '附件已刪除。',
   taskActions: '任務操作',
   copyTaskId: '複製任務 ID',
   copyTitle: '複製標題',

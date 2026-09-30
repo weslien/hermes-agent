@@ -324,6 +324,15 @@ export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/r
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
 
+/** Fetch an attachment as a base64 data URL (JSON envelope). The desktop IPC
+ *  bridge JSON-parses every response, so the binary FileResponse endpoint is
+ *  unusable from the renderer; this endpoint wraps the file in a JSON object. */
+export const downloadAttachment = (id: number | string) =>
+  call<{ dataUrl: string; filename: string; contentType: string }>(withBoard(`/attachments/${id}/data-url`))
+
+export const deleteAttachment = (id: number | string) =>
+  call<{ ok: boolean; id: number }>(withBoard(`/attachments/${id}`), { method: 'DELETE' })
+
 export const createBoard = (slug: string, name: string, projectId?: string) =>
   call<{ board: { slug: string } }>('/boards', {
     method: 'POST',

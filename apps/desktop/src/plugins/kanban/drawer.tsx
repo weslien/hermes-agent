@@ -53,6 +53,8 @@ import {
   routedToScope,
   taskKey,
   uploadAttachment,
+  downloadAttachment,
+  deleteAttachment,
   useKanbanScope
 } from './api'
 import { ModelOverrideField, overridePatch } from './model-override'
@@ -471,10 +473,14 @@ const isAdminSummary = (summary: string) => /^status changed to \w+ \(dashboard\
 function AttachmentsSection({
   attachments,
   onUpload,
+  onDownload,
+  onDelete,
   pending
 }: {
   attachments: KanbanAttachment[]
   onUpload: (file: File) => void
+  onDownload: (attachment: KanbanAttachment) => void
+  onDelete: (attachment: KanbanAttachment) => void
   pending: boolean
 }) {
   const k = useKanban()
@@ -512,11 +518,30 @@ function AttachmentsSection({
       label={k.attachments(attachments.length)}
     >
       {attachments.length > 0 ? (
-        <ul className="flex flex-col gap-1">
+        <ul className="flex flex-col gap-0.5">
           {attachments.map(attachment => (
-            <li className="flex items-center gap-1.5 text-[0.75rem] text-(--ui-text-tertiary)" key={attachment.id}>
+            <li
+              className="flex items-center gap-1.5 text-[0.75rem] text-(--ui-text-tertiary) group"
+              key={attachment.id}
+            >
               <Codicon name="file" size="0.75rem" />
-              {attachment.filename}
+              <button
+                className="truncate hover:text-(--ui-text-primary) hover:underline cursor-pointer text-left flex-1 min-w-0"
+                onClick={() => onDownload(attachment)}
+                title={k.downloadAttachment}
+                type="button"
+              >
+                {attachment.filename}
+              </button>
+              <Button
+                aria-label={k.removeAttachment}
+                className="opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
+                onClick={() => onDelete(attachment)}
+                size="icon-xs"
+                variant="ghost"
+              >
+                <Codicon name="close" size="0.7rem" />
+              </Button>
             </li>
           ))}
         </ul>
@@ -885,6 +910,29 @@ export function TaskDrawer({
     onSuccess: invalidate
   })
 
+  const downloadMut = useMutation({
+    mutationFn: async (attachment: KanbanAttachment) => {
+      const result = await downloadAttachment(attachment.id)
+      // Trigger a browser download from the data URL.
+      const link = document.createElement('a')
+      link.href = result.dataUrl
+      link.download = result.filename || attachment.filename || 'attachment'
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+    },
+    onError: err => host.notify({ kind: 'error', message: errText(err) })
+  })
+
+  const deleteMut = useMutation({
+    mutationFn: async (attachment: KanbanAttachment) => deleteAttachment(attachment.id),
+    onError: err => host.notify({ kind: 'error', message: errText(err) }),
+    onSuccess: () => {
+      host.notify({ kind: 'info', message: k.attachmentDeleted })
+      invalidate()
+    }
+  })
+
   if (!id) {
     return null
   }
@@ -1087,6 +1135,12 @@ export function TaskDrawer({
                   <AttachmentsSection
                     attachments={detail.attachments}
                     onUpload={file => uploadMut.mutate(file)}
+                    onDownload={attachment => downloadMut.mutate(attachment)}
+                    onDelete={attachment => {
+                      if (confirm(k.confirmRemoveAttachment)) {
+                        deleteMut.mutate(attachment)
+                      }
+                    }}
                     pending={uploadMut.isPending}
                   />
                 )}

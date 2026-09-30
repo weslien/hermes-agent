@@ -496,6 +496,35 @@ def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
         return FileResponse(path=str(stored), filename=att.filename, media_type=att.content_type or "application/octet-stream")
 
 
+@router.get("/attachments/{attachment_id}/data-url")
+def download_attachment_data_url(attachment_id: int, board: Optional[str] = Query(None)):
+    """Return the attachment as a base64 data URL inside a JSON envelope.
+
+    The desktop's IPC bridge (``fetchJson``) always JSON-parses responses, so a
+    binary ``FileResponse`` arrives corrupted. This endpoint encodes the file as
+    ``data:<mime>;base64,...`` and wraps it in ``{dataUrl, filename, contentType}``
+    so the renderer can decode and trigger a browser download.
+    """
+    import base64
+
+    with _board_conn(board) as (board, conn):
+        att = kanban_db.get_attachment(conn, attachment_id)
+        if att is None:
+            raise HTTPException(status_code=404, detail="attachment not found")
+        root = kanban_db.attachments_root(board=board).resolve()
+        try:
+            stored = Path(att.stored_path).resolve()
+            stored.relative_to(root)
+        except (ValueError, OSError):
+            raise HTTPException(status_code=404, detail="attachment file unavailable")
+        if not stored.is_file():
+            raise HTTPException(status_code=404, detail="attachment file missing on disk")
+        ctype = att.content_type or "application/octet-stream"
+        data = stored.read_bytes()
+        b64 = base64.b64encode(data).decode("ascii")
+        return {"dataUrl": f"data:{ctype};base64,{b64}", "filename": att.filename, "contentType": ctype}
+
+
 @router.delete("/attachments/{attachment_id}")
 def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
     with _board_conn(board) as (board, conn):
