@@ -276,13 +276,16 @@ class MattermostAdapter(BasePlatformAdapter):
         return data["root_id"] if data and data.get("root_id") else post_id
 
     async def _bot_participates_in_thread(self, root_id: str) -> bool:
-        """True if the bot itself has a post in thread ``root_id``."""
+        """True if the bot itself has a post in thread ``root_id``. Bounded and shape-guarded:
+        a slow or malformed response must never stall the websocket reader or raise out of it."""
         try:
-            data = await self._api_get(f"posts/{root_id}/thread")
+            data = await asyncio.wait_for(self._api_get(f"posts/{root_id}/thread"), timeout=5.0)
         except Exception as exc:
             logger.warning("Mattermost: thread participation check failed for %s: %s", root_id, exc)
             return False
-        posts = (data or {}).get("posts") or {}
+        if not isinstance(data, dict):
+            return False
+        posts = data.get("posts") or {}
         return any(isinstance(p, dict) and p.get("user_id") == self._bot_user_id for p in posts.values())
 
     async def _participated_thread_admits(self, channel_id: str, root_id: Optional[str]) -> bool:
@@ -290,12 +293,20 @@ class MattermostAdapter(BasePlatformAdapter):
         when its thread already contains a bot post AND the channel opted into
         ``participated_thread_channels`` (extra key or MATTERMOST_PARTICIPATED_THREAD_CHANNELS).
         Verification is server-side via the thread-posts API, so participation survives gateway
-        restarts with no local bookkeeping. Fails closed: API errors admit nothing."""
+        restarts with no local bookkeeping. Fails closed: API errors admit nothing. An explicit
+        ``allowed_channels`` whitelist always wins — a channel fenced out there is never admitted
+        here, even if it is listed in participated_thread_channels. Called only from the serial
+        websocket reader; repurpose under concurrency only with in-flight deduplication (the
+        bounded cache is not a lock)."""
         if not root_id:
             return False
         channels = _channel_id_set(_extra_or_secret(self.config.extra,
             "participated_thread_channels", "MATTERMOST_PARTICIPATED_THREAD_CHANNELS", blank_is_unset=False))
         if channel_id not in channels:
+            return False
+        allowed_channels = _channel_id_set(_extra_or_secret(self.config.extra,
+            "allowed_channels", "MATTERMOST_ALLOWED_CHANNELS", blank_is_unset=False))
+        if allowed_channels and channel_id not in allowed_channels:
             return False
         cached = self._thread_participation.get(root_id)
         if cached is not None:

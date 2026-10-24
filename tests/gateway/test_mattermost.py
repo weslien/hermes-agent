@@ -459,6 +459,47 @@ class TestParticipatedThreadAdmission:
             self.adapter._api_get.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_participated_thread_uses_extra_key_not_env(self):
+        """The config.extra['participated_thread_channels'] YAML branch admits the same way."""
+        with patch.dict(os.environ, {}):
+            os.environ.pop("MATTERMOST_PARTICIPATED_THREAD_CHANNELS", None)
+            os.environ.pop("MATTERMOST_REQUIRE_MENTION", None)
+            os.environ.pop("MATTERMOST_FREE_RESPONSE_CHANNELS", None)
+            os.environ.pop("MATTERMOST_ALLOWED_CHANNELS", None)
+            self.adapter.config.extra["participated_thread_channels"] = ["chan_456"]
+            self.adapter._api_get = AsyncMock(return_value={
+                "posts": {"p1": {"user_id": "bot_user_id"}}})
+            await self.adapter._handle_ws_event(self._make_thread_event("hello", root_id="root_5"))
+            assert self.adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_participated_thread_swallows_non_dict_api_body(self):
+        """A non-dict 200 body admits nothing and must not raise out of the ws handler."""
+        with patch.dict(os.environ, {"MATTERMOST_PARTICIPATED_THREAD_CHANNELS": "chan_456"}):
+            os.environ.pop("MATTERMOST_REQUIRE_MENTION", None)
+            os.environ.pop("MATTERMOST_FREE_RESPONSE_CHANNELS", None)
+            os.environ.pop("MATTERMOST_ALLOWED_CHANNELS", None)
+            self.adapter._api_get = AsyncMock(return_value=[{"user_id": "bot_user_id"}])
+            await self.adapter._handle_ws_event(self._make_thread_event("hello", root_id="root_6"))
+            assert not self.adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_participated_thread_respects_allowed_channels_fence(self):
+        """allowed_channels wins: a channel missing from the whitelist is never admitted,
+        even when listed in participated_thread_channels."""
+        with patch.dict(os.environ, {
+            "MATTERMOST_PARTICIPATED_THREAD_CHANNELS": "chan_456",
+            "MATTERMOST_ALLOWED_CHANNELS": "chan_official",
+        }):
+            os.environ.pop("MATTERMOST_REQUIRE_MENTION", None)
+            os.environ.pop("MATTERMOST_FREE_RESPONSE_CHANNELS", None)
+            self.adapter._api_get = AsyncMock(return_value={
+                "posts": {"p1": {"user_id": "bot_user_id"}}})
+            await self.adapter._handle_ws_event(self._make_thread_event("hello", root_id="root_7"))
+            assert not self.adapter.handle_message.called
+            self.adapter._api_get.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_participated_thread_ignores_top_level_posts(self):
         """Top-level posts (no root_id) never admit via participation — threads only."""
         with patch.dict(os.environ, {"MATTERMOST_PARTICIPATED_THREAD_CHANNELS": "chan_456"}):
