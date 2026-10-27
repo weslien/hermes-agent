@@ -270,6 +270,10 @@ def gc_terminal_workspaces(
 
     Returns ``(task id, workspace path)`` pairs — removed, or due in a dry run.
     """
+    if status == "done" and completed_before is None:
+        # A done sweep is defined by its grace window; without a bound it would
+        # collect every done card's workspace regardless of age.
+        raise ValueError("gc_terminal_workspaces: completed_before is required when status is 'done'")
     scratch_root = _kb.workspaces_root(board)
     where = "status = ?"
     params: tuple = (status,)
@@ -294,7 +298,17 @@ def gc_terminal_workspaces(
                         continue
                     # Same preserve predicate the real removal runs below, so the
                     # preview lists only worktrees a real pass can really collect.
-                    if not _worktree_preserve_reason(Path(wt_path))[0]:
+                    # Armored like that removal: one unreadable candidate skips its
+                    # row, it never aborts the preview.
+                    try:
+                        reason, _ = _worktree_preserve_reason(Path(wt_path))
+                    except Exception as exc:
+                        _kb._log.warning(
+                            "gc dry-run: skipping worktree %s (cannot evaluate): %s",
+                            wt_path, exc,
+                        )
+                        continue
+                    if not reason:
                         collected.append((tid, wt_path))
                     continue
                 if _defer_shared_worktree_cleanup(conn, tid, wt_path):

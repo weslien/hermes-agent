@@ -330,6 +330,50 @@ def test_cmd_gc_dry_run_lists_and_removes_nothing(board, capsys):
         assert _event_rows(conn, tid) == 0
 
 
+def test_gc_terminal_workspaces_done_requires_an_age_bound(board):
+    """Without ``completed_before`` a done sweep would collect every done card's
+    workspace regardless of age; the function must refuse that call shape."""
+    from hermes_cli import kanban_db_workspace as kbw
+
+    with kbc.connect_closing() as conn:
+        with pytest.raises(ValueError):
+            kbw.gc_terminal_workspaces(conn, status="done")
+        # The archived sweep keeps its no-bound shape (every archived card).
+        assert kbw.gc_terminal_workspaces(conn, status="archived") == []
+
+
+def test_cmd_gc_dry_run_skips_a_worktree_it_cannot_evaluate(board, monkeypatch, capsys):
+    """A candidate worktree the preserve predicate cannot even evaluate must
+    skip its row, not abort the preview; the real pass is armed the same way."""
+    from hermes_cli import kanban_db_workspace as kbw
+
+    def _raise(wp):
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(kbw, "_worktree_preserve_reason", _raise)
+    with kbc.connect_closing() as conn:
+        done = _done_scratch_workspace(conn, completed_at=0)
+        wt_task = kb.create_task(conn, title="done with worktree")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', completed_at=0, workspace_kind='worktree', "
+                "workspace_path=? WHERE id=?",
+                (str(kb.workspaces_root() / "opaque-worktree"), wt_task),
+            )
+        (kb.workspaces_root() / "opaque-worktree").mkdir(parents=True)
+
+    assert kanban_ops._cmd_gc(_args(dry_run=True)) == 0
+    out = capsys.readouterr().out
+    assert done.name in out                        # scratch rows still previewed
+    assert "opaque-worktree" not in out            # unreadable candidate skipped, not listed
+    assert (kb.workspaces_root() / "opaque-worktree").is_dir()
+
+    # The real pass is armored the same way: the unreadable worktree survives it.
+    assert kanban_ops._cmd_gc(_args()) == 0
+    assert (kb.workspaces_root() / "opaque-worktree").is_dir()
+    assert not done.exists()
+
+
 def test_done_workspace_retention_config_default_and_reader(board):
     """The knob is registered (``DEFAULT_CONFIG``) and the notifier's reader
     honours a user config.yaml through the same loader the watcher uses."""
