@@ -302,7 +302,7 @@ def gc_terminal_workspaces(
                     # row, it never aborts the preview.
                     try:
                         reason, _ = _worktree_preserve_reason(Path(wt_path))
-                    except Exception as exc:
+                    except Exception as exc:  # health: allow BLE001 -- one unreadable candidate skips its row; the preview must never abort
                         _kb._log.warning(
                             "gc dry-run: skipping worktree %s (cannot evaluate): %s",
                             wt_path, exc,
@@ -519,7 +519,7 @@ def _worktree_preserve_reason(wp: Path) -> tuple[Optional[str], Optional[Path]]:
     predicate so the preview lists only paths a real pass can really collect."""
     try:
         from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
-    except Exception:
+    except Exception:  # health: allow BLE001 -- predicates unavailable means preserve, never guess
         return "unavailable", None  # CLI safety predicates unavailable — preserve
     common = _git_common_dir(wp)
     if common is None or common.name != ".git":
