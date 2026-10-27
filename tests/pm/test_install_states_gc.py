@@ -83,3 +83,31 @@ def test_partly_removed_orphan_keeps_its_record_until_retried(tmp_path):
     finally:
         stuck.chmod(0o700)
     assert collect_orphan_install_states(installs) == [state] and not state.exists()
+
+
+def test_ws_view_of_a_dropped_workspace_is_provably_deleted(tmp_path):
+    """A ``ws`` overlay's view dir goes with its workspace: a vanished entry
+    below a surviving ``.ws/workspaces`` dir was deleted where we can see it,
+    while a live view (still mounted) and a vanished ``.ws`` root are kept."""
+    # The data root (what owns installs/) is tmp_path/home/.hermes; the shared
+    # checkout holding its .ws overlay sits outside it, like ~/src on a host.
+    installs = tmp_path / "home" / ".hermes" / "installs"
+    views = tmp_path / "src" / "repo" / ".ws" / "workspaces"
+    views.mkdir(parents=True)
+    live_view = _state(installs, "aaaa", views / "t_111")
+    (views / "t_111").mkdir()
+    gone_view = _state(installs, "bbbb", views / "t_222")
+    unknown = _state(installs, "cccc", tmp_path / "gone-repo" / ".ws" / "workspaces" / "t_333")
+
+    assert orphan_install_states(installs) == [gone_view]
+    assert collect_orphan_install_states(installs) == [gone_view] and not gone_view.exists()
+    assert live_view.is_dir() and unknown.is_dir()
+
+
+def test_collect_orphan_install_states_dry_run_removes_nothing(tmp_path):
+    installs = tmp_path / "installs"
+    orphan = _state(installs, "dddd", tmp_path / "dropped-workspace")
+
+    assert collect_orphan_install_states(installs, dry_run=True) == [orphan]
+    assert orphan.is_dir()
+    assert collect_orphan_install_states(installs) == [orphan] and not orphan.exists()

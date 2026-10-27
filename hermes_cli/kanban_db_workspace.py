@@ -252,6 +252,80 @@ def _defer_shared_worktree_cleanup(
     )
 
 
+def gc_terminal_workspaces(
+    conn: sqlite3.Connection, *, status: str,
+    completed_before: Optional[int] = None, board: Optional[str] = None,
+    dry_run: bool = False,
+) -> list[tuple[str, str]]:
+    """Collect one terminal status's workspace rows: ``hermes kanban gc`` and the
+    notifier's hourly sweep (``gateway/kanban_watchers_notifier.py``).
+
+    Rows are tasks with *status* (the ``archived`` sweep has no age filter), or
+    ``done`` rows with ``completed_at <= completed_before`` (epoch seconds).
+    Same safety predicates as completion-time cleanup (#28818, #33774): managed
+    scratch paths only, deferral while another live task shares the path, deferral
+    while any child is still non-terminal (a child may still read handoff
+    artifacts from this workspace), worktrees clean+fully-pushed only; any doubt
+    keeps the dir. A dry run never writes: no removal, no defer event.
+
+    Returns ``(task id, workspace path)`` pairs — removed, or due in a dry run.
+    """
+    scratch_root = _kb.workspaces_root(board)
+    where = "status = ?"
+    params: tuple = (status,)
+    if completed_before is not None:
+        where += " AND completed_at IS NOT NULL AND completed_at <= ?"
+        params += (completed_before,)
+    rows = conn.execute(
+        "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
+        f"WHERE {where}", params,
+    ).fetchall()
+    collected: list[tuple[str, str]] = []
+    for row in rows:
+        tid = row["id"]
+        if _has_active_children(conn, tid):
+            continue
+        if row["workspace_kind"] == "worktree":
+            # Backstop for worktrees that escaped the completion/archive hook.
+            wt_path = row["workspace_path"]
+            if wt_path and Path(wt_path).is_dir():
+                if dry_run:
+                    if _workspace_in_use_by_other(conn, tid, wt_path) is not None:
+                        continue
+                elif _defer_shared_worktree_cleanup(conn, tid, wt_path):
+                    continue
+                if dry_run:
+                    collected.append((tid, wt_path))
+                    continue
+                _cleanup_worktree_workspace(tid, wt_path, row["branch_name"])
+                if not Path(wt_path).is_dir():
+                    collected.append((tid, wt_path))
+            continue
+        if row["workspace_kind"] != "scratch":
+            continue
+        path = Path(row["workspace_path"] or (scratch_root / tid))
+        # Same containment predicate as completion cleanup (#28818): strictly below a
+        # managed root, never the root itself (which holds every task's scratch dir).
+        # Cheap existence/symlink check first: most rows were already cleaned at
+        # completion, and rmtree refuses a symlink (so it must not be counted).
+        if not path.is_dir() or path.is_symlink() or not _is_managed_scratch_path(path):
+            continue
+        # dry-run mode: the same check the defer helper uses, without the event write.
+        if dry_run:
+            if _workspace_in_use_by_other(conn, tid, path) is not None:
+                continue
+        elif _defer_shared_workspace_cleanup(conn, tid, path):
+            continue
+        else:
+            shutil.rmtree(path, ignore_errors=True)
+            if path.is_dir():
+                _kb._log.debug(
+                    "gc terminal workspaces: %s was recreated under the removal; left for the next pass", path)
+                continue
+        collected.append((tid, str(path)))
+    return collected
+
+
 def _lexical_path(path: Path | str) -> Path:
     """Absolute, ``..``-collapsed, NFC form of *path* WITHOUT following symlinks."""
     return Path(_path_key(os.path.abspath(path)))

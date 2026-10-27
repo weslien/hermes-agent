@@ -181,8 +181,12 @@ def lease_directory(generation: Path) -> Callable[[], None]:
     return release
 
 
-def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> list[Path]:
-    """Remove unselected lease-managed generations after their readers exit."""
+def collect_generations(project: Path, *, min_age_seconds: float = 86400, dry_run: bool = False) -> list[Path]:
+    """Remove unselected lease-managed generations after their readers exit.
+
+    With ``dry_run`` the generations a real pass would remove are returned and
+    nothing is; the publication recovery is a write, so it is skipped too.
+    """
     from pm.environments import selected_venv
     removed = []
     root = install_state_dir(project)
@@ -191,7 +195,8 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
     with runtime_lock(project) as held:
         if not held:
             return removed  # maintenance: another process owns the install, skip rather than queue
-        recover_publication(project)
+        if not dry_run:
+            recover_publication(project)
         selected = selected_venv(project).parent.resolve()
         generations = root / "environments"
         if not generations.is_dir():
@@ -203,7 +208,8 @@ def collect_generations(project: Path, *, min_age_seconds: float = 86400) -> lis
             if not marker.is_file() or time.time() - marker.stat().st_mtime < min_age_seconds:
                 continue
             if not leases_held(generation):
-                shutil.rmtree(generation)
+                if not dry_run:
+                    shutil.rmtree(generation)
                 removed.append(generation)
     return removed
 

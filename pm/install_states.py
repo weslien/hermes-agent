@@ -11,9 +11,11 @@ The state dir records the checkout it belongs to in ``inputs/.project-root`` (wr
 checkout is gone: a data root shared with a container (``-v ~/.hermes:/opt/data``) or an
 unmounted volume records paths this process cannot see. So a dir is an orphan only when its
 checkout sat where this process can see that it was deleted -- under the data root that owns
-``installs/`` (scratch clones, the runtime checkout) or directly in a ``.worktrees/`` dir that
-still exists. Removal still fails closed on anything a live process could hold: the install
-lock, or a dependency / PM runtime generation lease.
+``installs/`` (scratch clones, the runtime checkout), directly in a ``.worktrees/`` dir that
+still exists, or in a ``ws`` agent-overlay view under ``.ws/workspaces/`` while the views dir
+still exists (the view directory goes with its dropped workspace). Removal still fails closed
+on anything a live process could hold: the install lock, or a dependency / PM runtime
+generation lease.
 """
 
 from __future__ import annotations
@@ -30,7 +32,12 @@ logger = logging.getLogger(__name__)
 def _provably_deleted(root: Path, data_root: Path) -> bool:
     if root.exists():
         return False
-    return root.is_relative_to(data_root) or (root.parent.name == ".worktrees" and root.parent.is_dir())
+    if root.is_relative_to(data_root) or (root.parent.name == ".worktrees" and root.parent.is_dir()):
+        return True
+    # `ws` agent overlays: the view dir goes with its workspace, so a vanished entry
+    # below a surviving `.ws/workspaces` dir was deleted where we can see it. A live,
+    # mounted view still exists and fails the check above.
+    return any(p.name == "workspaces" and p.parent.name == ".ws" and p.is_dir() for p in root.parents)
 
 
 def orphan_install_states(installs: Path) -> list[Path]:
@@ -77,12 +84,18 @@ def _held(state: Path) -> bool:
     return False
 
 
-def collect_orphan_install_states(installs: Path) -> list[Path]:
-    """Remove every unheld orphan state dir under *installs*; returns what was removed."""
+def collect_orphan_install_states(installs: Path, *, dry_run: bool = False) -> list[Path]:
+    """Remove every unheld orphan state dir under *installs*; returns what was removed.
+
+    With ``dry_run`` the orphans a real pass would remove are returned and nothing is.
+    """
     removed: list[Path] = []
     for state in orphan_install_states(installs):
         if _held(state):
             logger.debug("orphan install state %s is still held; skipped", state.name)
+            continue
+        if dry_run:
+            removed.append(state)
             continue
         # The record goes last, and only once everything else is gone: the startup prune runs on
         # a daemon thread and a removal can fail part-way (an open file on Windows, a read-only
