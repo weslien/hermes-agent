@@ -89,6 +89,39 @@ def test_a_finite_run_creates_mains_oneshot_session_so_bare_c_finds_it(store, mo
     assert client.calls[-1][1]["source"] == "cli"
 
 
+def test_bridged_automation_source_claims_this_runs_surface(store, monkeypatch):
+    """A `chat -q` spawned inside a kanban/cron/a2a shell inherits that session's
+    HERMES_SESSION_SOURCE; the create contract refuses a non-surface label with
+    ``invalid_params`` before the store can report why. Claim this run's own surface
+    instead; an explicit ``--source`` is refused as gateway_chat refuses it."""
+    db, client = store
+    contract = {"session_create": {"sources": ["cli", "oneshot", "tui", "gui", "acp", "tool"],
+                                   "parameters": []}}
+    original = client.rpc
+
+    async def rpc(method, *, _timeout=None, **params):
+        if method == "runtime.describe":
+            client.calls.append((method, params))
+            return contract
+        return await original(method, _timeout=_timeout, **params)
+
+    client.rpc = rpc
+    for name in ("HERMES_SINGLE_QUERY_SESSION", "HERMES_SESSION_SOURCE", "HERMES_SESSION_SOURCE_EXPLICIT"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    db.open_session(cli(), {})
+    assert client.calls[-1][1]["source"] == "oneshot"
+
+    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION")
+    GatewaySessionStore(db.connection).open_session(cli(), {})
+    assert client.calls[-1][1]["source"] == "cli"
+
+    monkeypatch.setenv("HERMES_SESSION_SOURCE_EXPLICIT", "1")
+    with pytest.raises(GatewayClientError, match="does not support source 'kanban'"):
+        GatewaySessionStore(db.connection).open_session(cli(), {})
+
+
 def test_resume_attaches_and_unknown_target_is_left_to_mains_not_found_path(store):
     db, client = store
     assert db.open_session(cli("local-old", resumed=True)) == "local-old"
