@@ -894,7 +894,8 @@ def main(argv=None) -> int:
 
     p = sub.add_parser("gc", help="remove store entries nothing references")
     p.add_argument("--dry-run", action="store_true",
-                   help="list what a real pass would reclaim; remove nothing")
+                   help="list what a real pass would reclaim; remove nothing "
+                        "(coordination locks are still taken, abandoned leases pruned)")
     p.set_defaults(func=cmd_gc)
 
     p = sub.add_parser("bundle", help="stage a payload (repo+store+facts+relocatable venv) into --out")

@@ -1964,7 +1964,7 @@ DEFAULT_CONFIG = {
         # The notifier GC also collects `done` (not yet archived) tasks' workspaces older
         # than this many days — the same safety gates as `hermes kanban gc`: never a
         # workspace an open card or an active child still uses, shared paths deferred.
-        # 0 = off (keeps only the archived sweep).
+        # 0 = off (keeps only the archived sweep); negative values clamp to 0.
         "done_workspace_retention_days": 1,
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for

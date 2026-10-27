@@ -292,10 +292,12 @@ def gc_terminal_workspaces(
                 if dry_run:
                     if _workspace_in_use_by_other(conn, tid, wt_path) is not None:
                         continue
-                elif _defer_shared_worktree_cleanup(conn, tid, wt_path):
+                    # Same preserve predicate the real removal runs below, so the
+                    # preview lists only worktrees a real pass can really collect.
+                    if not _worktree_preserve_reason(Path(wt_path))[0]:
+                        collected.append((tid, wt_path))
                     continue
-                if dry_run:
-                    collected.append((tid, wt_path))
+                if _defer_shared_worktree_cleanup(conn, tid, wt_path):
                     continue
                 _cleanup_worktree_workspace(tid, wt_path, row["branch_name"])
                 if not Path(wt_path).is_dir():
@@ -497,6 +499,25 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
+def _worktree_preserve_reason(wp: Path) -> tuple[Optional[str], Optional[Path]]:
+    """Why :func:`_cleanup_worktree_workspace` would keep *wp*, and the repo root
+    of the linked worktree (None alongside a reason). gc's dry-run uses the same
+    predicate so the preview lists only paths a real pass can really collect."""
+    try:
+        from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
+    except Exception:
+        return "unavailable", None  # CLI safety predicates unavailable — preserve
+    common = _git_common_dir(wp)
+    if common is None or common.name != ".git":
+        return "not-worktree", None  # not a linked worktree of a normal repo — never guess
+    repo_root = common.parent
+    if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
+        return "main-checkout", repo_root  # never remove the main checkout
+    if _worktree_is_dirty(str(wp), str(repo_root)) or _worktree_has_unpushed_commits(str(wp)):
+        return "dirty-or-unpushed", repo_root
+    return None, repo_root  # a clean, fully pushed linked worktree — removable
+
+
 def _cleanup_worktree_workspace(
     task_id: str, path: str, branch_name: Optional[str] = None
 ) -> None:
@@ -507,24 +528,16 @@ def _cleanup_worktree_workspace(
     it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
     branches are kept. Best-effort."""
     try:
-        from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
-    except Exception:
-        return  # CLI safety predicates unavailable — preserve
-    try:
         wp = Path(path).expanduser()
         if not wp.is_dir():
             return
-        common = _git_common_dir(wp)
-        if common is None or common.name != ".git":
-            return  # not a linked worktree of a normal repo — never guess
-        repo_root = common.parent
-        if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
-            return  # never remove the main checkout
-        if _worktree_is_dirty(str(wp), str(repo_root)) or _worktree_has_unpushed_commits(str(wp)):
-            _kb._log.info(
-                "Preserving worktree for task %s: dirty or unpushed work at %s",
-                task_id, wp,
-            )
+        reason, repo_root = _worktree_preserve_reason(wp)
+        if reason or repo_root is None:
+            if reason == "dirty-or-unpushed":
+                _kb._log.info(
+                    "Preserving worktree for task %s: dirty or unpushed work at %s",
+                    task_id, wp,
+                )
             return
         # Windows cannot delete a directory while this process has its current
         # directory inside it. Completed workers normally run from their own

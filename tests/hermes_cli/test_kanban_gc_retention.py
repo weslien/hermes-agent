@@ -243,6 +243,16 @@ def test_cmd_gc_done_workspace_retention_bounds(board):
     with kbc.connect_closing() as conn:
         old = _done_scratch_workspace(conn, completed_at=0)
         fresh = _done_scratch_workspace(conn, completed_at=int(_time.time()))
+        # A done row with no completion stamp must never match the cutoff.
+        undated = kb.create_task(conn, title="done, no completion stamp")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', workspace_kind='scratch' WHERE id=?",
+                (undated,),
+            )
+        undated_ws = kb.workspaces_root() / undated
+        undated_ws.mkdir(parents=True)
+        (undated_ws / "undated.txt").write_text("no stamp", encoding="utf-8")
         open_tid = kb.create_task(conn, title="still open")
         with kb.write_txn(conn):
             conn.execute(
@@ -254,11 +264,11 @@ def test_cmd_gc_done_workspace_retention_bounds(board):
         (open_ws / "live.txt").write_text("in use", encoding="utf-8")
     # 0 disables the done sweep: every workspace survives.
     assert kanban_ops._cmd_gc(_args(done_ws_days=0)) == 0
-    assert old.is_dir() and fresh.is_dir() and open_ws.is_dir()
+    assert old.is_dir() and fresh.is_dir() and undated_ws.is_dir() and open_ws.is_dir()
     # 1 day: only the done workspace past the grace window goes; a done row with
     # no completed_at stamp never matches the cutoff, and open cards are untouchable.
     assert kanban_ops._cmd_gc(_args(done_ws_days=1)) == 0
-    assert not old.exists() and fresh.is_dir() and open_ws.is_dir()
+    assert not old.exists() and fresh.is_dir() and undated_ws.is_dir() and open_ws.is_dir()
 
 
 def test_cmd_gc_defers_a_done_workspace_with_active_children(board):
@@ -290,19 +300,32 @@ def test_cmd_gc_dry_run_lists_and_removes_nothing(board, capsys):
         done = _done_scratch_workspace(conn, completed_at=0)
         arch = _archived_scratch_workspace(conn)
         tid = _done_task_with_old_event(conn)
+        # A worktree-kind row whose path is not a linked worktree: the real
+        # pass preserves it, so the preview must not list it either.
+        fake_wt = kb.create_task(conn, title="done, not a worktree")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', completed_at=0, workspace_kind='worktree', "
+                "workspace_path=? WHERE id=?",
+                (str(kb.workspaces_root() / "fake-worktree-dir"), fake_wt),
+            )
+        fake_dir = kb.workspaces_root() / "fake-worktree-dir"
+        fake_dir.mkdir(parents=True)
+        (fake_dir / "marker.txt").write_text("not a git worktree", encoding="utf-8")
     log = _old_log_file()
 
     assert kanban_ops._cmd_gc(_args(dry_run=True)) == 0
     out = capsys.readouterr().out
     assert "would remove workspace of" in out
     assert done.name in out and arch.name in out
-    assert done.is_dir() and arch.is_dir() and log.exists()
+    assert fake_dir.name not in out
+    assert done.is_dir() and arch.is_dir() and fake_dir.is_dir() and log.exists()
     with kbc.connect_closing() as conn:
         assert _event_rows(conn, tid) > 0
 
     # The same state is really collected: workspaces, events, and the old log.
     assert kanban_ops._cmd_gc(_args()) == 0
-    assert not done.exists() and not arch.exists() and not log.exists()
+    assert not done.exists() and not arch.exists() and fake_dir.is_dir() and not log.exists()
     with kbc.connect_closing() as conn:
         assert _event_rows(conn, tid) == 0
 
@@ -323,3 +346,8 @@ def test_done_workspace_retention_config_default_and_reader(board):
     (home / "config.yaml").write_text(
         "kanban:\n  done_workspace_retention_days: 5\n", encoding="utf-8")
     assert _done_workspace_retention_days() == 5
+    # A negative value would build a future cutoff and sweep every done card
+    # at once; the reader must clamp it to "off" instead of trusting it.
+    (home / "config.yaml").write_text(
+        "kanban:\n  done_workspace_retention_days: -3\n", encoding="utf-8")
+    assert _done_workspace_retention_days() == 0
