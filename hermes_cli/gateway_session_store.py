@@ -70,6 +70,7 @@ class GatewaySessionStore:
         self.current: dict | None = None
         self._reader = None
         self._create_parameters = None
+        self._create_sources = ()
 
     def __bool__(self):
         return not self.connection.final
@@ -163,17 +164,28 @@ class GatewaySessionStore:
         title step); adopts and returns the new session id. ``record_cwd=False`` (``/new``,
         ``--create-if-missing``) leaves the row's cwd empty, as main's explicit creates did."""
         from agent.session_source import CLI_FAMILY_SOURCES, session_source_for
+        from gateway.session_context import get_session_env
+        env = self.client_env()  # one describe per store; also the create contract's claimable sources
         params = _creation_policy(launch or {})
         params["cwd"] = os.path.realpath(os.getenv("TERMINAL_CWD") or os.getcwd())
         # Main's row label: ``cli``, ``oneshot`` for a finite -q/-Q run, or an explicit --source.
-        params["source"] = session_source_for("cli")
+        source = session_source_for("cli")
+        if self._create_sources and source not in self._create_sources:
+            # The create contract accepts only the surfaces runtime.describe lists; a label the
+            # terminal tool bridges from the spawning session (kanban, cron, a2a, ...) is that
+            # session's row, not this run's. Claim this run's own surface; an explicit --source is
+            # refused as gateway_chat refuses it, never silently dropped.
+            if get_session_env("HERMES_SESSION_SOURCE_EXPLICIT", "") == "1":
+                raise GatewayClientError(f"Gateway does not support source {source!r}")
+            source = "oneshot" if get_session_env("HERMES_SINGLE_QUERY_SESSION", "") == "1" and "oneshot" in self._create_sources else "cli"
+        params["source"] = source
         # Main's row stamp (run_agent._launch_cwd_for_session): this process's cwd (``-w`` never
         # chdirs, so the repo root), only for a CLI-family label on a local terminal backend.
         local = (os.getenv("TERMINAL_ENV") or "local").strip().lower() in ("", "local")
         params["row_cwd"] = os.getcwd() if record_cwd and local and params["source"] in CLI_FAMILY_SOURCES else ""
         if title:
             params["title"] = title
-        params.update(self.client_env())
+        params.update(env)
         snapshot = self.call("session.create", request_id=uuid.uuid4().hex, **params)
         warning = (snapshot.get("info") or {}).get("config_warning")
         if warning:
@@ -187,6 +199,7 @@ class GatewaySessionStore:
             described = self.call("runtime.describe")
             contract = described.get("session_create") if isinstance(described, dict) else None
             self._create_parameters = list((contract or {}).get("parameters") or [])
+            self._create_sources = tuple((contract or {}).get("sources") or ())
         return client_env_policy(self._create_parameters)
 
     def branch(self, session_id, title=None):
