@@ -248,7 +248,7 @@ def gitlab(tmp_path, monkeypatch):
                 return
             pipeline = None if state.get("missing") else {
                 "id": 269000, "sha": state.get("pipeline_sha", state["head"]),
-                "status": state["pipeline"], "ref": "refs/merge-requests/1867/head",
+                "status": state["pipeline"], "ref": state.get("ref", "refs/merge-requests/1867/head"),
                 "web_url": "https://gitlab.evroc.dev/engineering/think/-/pipelines/269000"}
             value = {"state": state.get("mr_state", "opened"),
                      "diff_refs": {"head_sha": state["head"]},
@@ -326,6 +326,15 @@ def test_mr_completion_requires_current_pipeline_evidence(gitlab):
         assert receipt["detail"] == "Supply metadata.published_pr matching the persisted completion contract."
         assert len(gitlab["requests"]) == before
         assert not kb.complete_task(conn, tid, result="done")
+        # A merged-result pipeline (temp merge ref, sha != source HEAD) must satisfy the gate.
+        gitlab.update(pipeline="success", head="a" * 40)
+        gitlab["pipeline_sha"] = "c" * 40
+        gitlab["ref"] = "refs/merge-requests/1867/merge"
+        tid = kb.create_task(conn, title="merged-result", completion_contract="engineering/think")
+        assert kb.complete_task(conn, tid, result="done", metadata={"published_pr": mr})
+        assert kb.get_task(conn, tid).status == "done"
+        gitlab.pop("pipeline_sha")
+        gitlab.pop("ref")
         # Nested groups declare the exact MR URL itself.
         nested = "https://gitlab.evroc.dev/group/sub/repo/-/merge_requests/12"
         gitlab.update(pipeline="success", head="a" * 40)

@@ -149,7 +149,14 @@ def _collect_gitlab(match: re.Match, receipt: dict, *, profile_home: str | None)
         # No pipeline = no evidence, the exact mirror of GitHub's no-required-checks stop.
         receipt["detail"] = "No pipeline exists for the MR; explicitly use a local-only contract for non-CI tasks."
         return
-    classification = "stale" if pipeline.get("sha") != sha else _GL_PIPELINE_STATUS.get(pipeline.get("status"), "infra")
+    # shortcut: merged-result/merge pipelines run on a temp merge ref whose sha is NOT the
+    # source HEAD by design; only a head-ref pipeline with a differing sha is stale evidence.
+    if pipeline.get("sha") == sha:
+        classification = _GL_PIPELINE_STATUS.get(pipeline.get("status"), "infra")
+    elif (pipeline.get("ref") or "").endswith("/head"):
+        classification = "stale"
+    else:
+        classification = _GL_PIPELINE_STATUS.get(pipeline.get("status"), "infra")
     receipt["checks"].append({"name": f"pipeline/{pipeline.get('id')}", "url": pipeline.get("web_url"),
                               "head_sha": pipeline.get("sha"), "classification": classification})
     current = _gl_api(endpoint, profile_home=profile_home)
