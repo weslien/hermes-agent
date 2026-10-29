@@ -256,3 +256,70 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+def test_decompose_parks_needs_input_block_loop(kanban_home):
+    """A needs_input card that already hit the block-loop limit is
+    parked in ``scheduled`` instead of being re-promoted by the
+    auto-decomposer."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="x", triage=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET block_kind = 'needs_input', block_recurrences = ? WHERE id = ?",
+                (kb.BLOCK_RECURRENCE_LIMIT, tid),
+            )
+
+    outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    assert outcome.ok is False
+    assert "parked in scheduled" in outcome.reason
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "scheduled"
+
+
+def test_decompose_allows_capability_block_loop(kanban_home):
+    """Cards with block kinds other than ``needs_input`` keep flowing
+    through the decomposer even past the recurrence limit."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="x", triage=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET block_kind = 'capability', block_recurrences = ? WHERE id = ?",
+                (kb.BLOCK_RECURRENCE_LIMIT, tid),
+            )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "promote",
+        "title": "Released",
+        "body": "y",
+    })
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+    assert outcome.ok is True
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status in ("todo", "ready")
+    assert task.status != "scheduled"
+
+
+def test_schedule_task_accepts_triage(kanban_home):
+    """``schedule_task`` must accept a task in ``triage`` so the
+    block-loop gate can park it."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="x", triage=True)
+        ok = kb.schedule_task(conn, tid, reason="test park")
+    assert ok is True
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "scheduled"
+
+

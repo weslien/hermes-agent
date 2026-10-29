@@ -313,6 +313,17 @@ def decompose_task(
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
 
+    # Park needs_input cards past the block-loop limit; do not re-promote.
+    if task.block_kind == "needs_input" and task.block_recurrences >= kb.BLOCK_RECURRENCE_LIMIT:
+        with kbc.connect_closing() as conn:
+            ok = kb.schedule_task(
+                conn, task.id,
+                reason="needs_input block-loop detected; parked until orchestrator unblocks",
+            )
+        if ok:
+            return DecomposeOutcome(task.id, False, "parked in scheduled due to needs_input block loop")
+        return DecomposeOutcome(task.id, False, "block-loop gate: schedule_task failed")
+
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(
         "decompose", task_id, aux_task="kanban_decomposer", system=_SYSTEM_PROMPT,

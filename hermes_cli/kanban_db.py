@@ -3880,7 +3880,7 @@ def schedule_task(
                    claim_expires= NULL,
                    worker_pid   = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status IN ('todo', 'ready', 'running', 'blocked', 'triage')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
