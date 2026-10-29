@@ -1,4 +1,5 @@
-"""Exact-head GitHub acceptance for explicitly declared PR tasks.
+"""Exact-head acceptance for explicitly declared PR/MR tasks: GitHub PRs via
+``gh``, GitLab MRs via API v4 with the assignee profile's own GITLAB_TOKEN.
 
 Network work happens outside SQLite transactions. The lifecycle owner persists
 receipts only after rechecking the captured run/status/contract under its lock.
@@ -11,20 +12,29 @@ org's private repos (#122689).
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
 from urllib.parse import quote
 
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
+_MR = re.compile(r"https://gitlab\.evroc\.dev/((?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+)/-/merge_requests/([1-9][0-9]*)")
+
+
+def _match_pr(url: str | None):
+    """The PR or MR URL (GitHub or GitLab), wherever it came from: repo path and number captured."""
+    return _PR.fullmatch(url or "") or _MR.fullmatch(url or "")
 
 
 def validate_contract(value: str | None) -> str:
     if value is None or value == "local-only":
         return "local-only"
-    if not isinstance(value, str) or not (_REPO.fullmatch(value) or _PR.fullmatch(value)):
-        raise ValueError("completion_contract must be local-only, OWNER/REPO, or an exact GitHub PR URL")
+    if not isinstance(value, str) or not (_REPO.fullmatch(value) or _match_pr(value)):
+        raise ValueError("completion_contract must be local-only, OWNER/REPO, an exact GitHub PR URL, or an exact GitLab MR URL")
     return value
 
 
@@ -90,6 +100,66 @@ def _gh_env(profile_home: str | None) -> dict[str, str] | None:
     return env
 
 
+def _gl_api(endpoint: str, *, profile_home: str | None = None):
+    """GitLab API v4 mirror of :func:`_api`: :func:`_gh_env` supplies the assignee
+    profile's served env — its own GITLAB_TOKEN when it declares one, the completing
+    process's otherwise. No GITLAB_TOKEN anywhere classifies `auth`, not `infra`.
+    The token stays in this process — no argv, and only the HTTP code + endpoint are
+    ever persisted."""
+    env = _gh_env(profile_home) or os.environ
+    token = env.get("GITLAB_TOKEN")
+    if not token:
+        raise _GateAuthError(f"GITLAB_TOKEN is not set for {endpoint.split('?')[0]}")
+    host = env.get("GITLAB_HOST", "gitlab.evroc.dev")
+    base = host if "://" in host else f"https://{host}"
+    request = urllib.request.Request(f"{base}/api/v4/{endpoint}",
+                                     headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        # 401/403/404 = the token cannot see this project (wrong identity or missing
+        # grant), not a transient API failure; the body stays out of any receipt.
+        if exc.code in (401, 403, 404):
+            raise _GateAuthError(f"HTTP {exc.code} on {endpoint.split('?')[0]}") from None
+        raise
+
+
+_GL_PIPELINE_STATUS = {
+    "success": "success",
+    "failed": "failure",
+    "created": "pending", "waiting_for_resource": "pending", "preparing": "pending",
+    "pending": "pending", "running": "pending", "scheduled": "pending",
+    # canceled/skipped/manual mirror GitHub's dropped check-run conclusions: never acceptable.
+    "canceled": "infra", "skipped": "infra", "manual": "infra",
+}
+
+
+def _collect_gitlab(match: re.Match, receipt: dict, *, profile_home: str | None):
+    """GitLab MR read mirroring the GitHub checks: MR state, the head pipeline as the
+    one required check, then a re-read — an old-head success is never transferable."""
+    endpoint = f"projects/{quote(match[1], safe='')}/merge_requests/{match[2]}"
+    mr = _gl_api(endpoint, profile_home=profile_home)
+    sha = (mr.get("diff_refs") or {}).get("head_sha")
+    receipt["head_sha"] = sha
+    if mr.get("state") not in {"opened", "merged"} or not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+        raise ValueError("MR is closed or current head is unavailable")
+    pipeline = mr.get("head_pipeline") or mr.get("pipeline")
+    if not pipeline:
+        # No pipeline = no evidence, the exact mirror of GitHub's no-required-checks stop.
+        receipt["detail"] = "No pipeline exists for the MR; explicitly use a local-only contract for non-CI tasks."
+        return
+    classification = "stale" if pipeline.get("sha") != sha else _GL_PIPELINE_STATUS.get(pipeline.get("status"), "infra")
+    receipt["checks"].append({"name": f"pipeline/{pipeline.get('id')}", "url": pipeline.get("web_url"),
+                              "head_sha": pipeline.get("sha"), "classification": classification})
+    current = _gl_api(endpoint, profile_home=profile_home)
+    if (current.get("diff_refs") or {}).get("head_sha") != sha or current.get("state") not in {"opened", "merged"}:
+        receipt.update(classification="stale", detail="MR head or state changed while collecting evidence; retry.")
+        return
+    receipt["classification"] = classification
+    receipt["ok"] = classification == "success"
+
+
 def _assignee_profile_home(assignee: str | None) -> str | None:
     """Home whose ``gh`` login must read the contract repo — the assignee's, resolved
     exactly as the dispatcher resolves the worker's home — or None (unassigned) so the
@@ -111,15 +181,20 @@ def collect_acceptance(contract: str, published_pr: str | None,
                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
     try:
+        backend = "GitHub"
         profile_home = _assignee_profile_home(assignee)
-        declared = _PR.fullmatch(contract)
+        declared = _match_pr(contract)
         url = contract if declared else published_pr
-        match = _PR.fullmatch(url or "")
+        match = _match_pr(url)
         if not match or (not declared and match[1] != contract) or (declared and published_pr and published_pr != contract):
             receipt["detail"] = "Supply metadata.published_pr matching the persisted completion contract."
             return receipt
         repo, number = match[1], int(match[2])
         receipt["pr_url"] = url
+        if match.re is not _PR:
+            backend = "GitLab"
+            _collect_gitlab(match, receipt, profile_home=profile_home)
+            return receipt
         owner, name = repo.split("/")
         query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
         repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
@@ -179,14 +254,16 @@ def collect_acceptance(contract: str, published_pr: str | None,
         receipt["ok"] = receipt["classification"] == "success"
         return receipt
     except _GateAuthError as exc:
-        login = f"assignee profile {assignee!r}'s gh login" if assignee else "the ambient gh login"
+        cred = "gh login" if backend == "GitHub" else "GITLAB_TOKEN"
+        login = f"assignee profile {assignee!r}'s {cred}" if assignee else f"the ambient {cred}"
         receipt.update(classification="auth",
-                       detail=f"GitHub refused the acceptance read ({exc}) as {login}; "
-                              "fix that profile's GitHub credentials/access to the repository, then retry completion.")
+                       detail=f"{backend} refused the acceptance read ({exc}) as {login}; "
+                              f"fix that profile's {backend} credentials/access to the repository, then retry completion.")
         return receipt
     except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
-        # Never persist gh stderr (credentials/host details); the failed phase is actionable.
-        receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
+        # Never persist gh stderr or API error bodies (credentials/host details); the failed phase is actionable.
+        how = "gh authentication/API access" if backend == "GitHub" else "GitLab authentication/API access"
+        receipt.update(classification="infra", detail=f"{backend} acceptance evidence unavailable or incomplete; check {how} and retry.")
         return receipt
 
 
