@@ -404,5 +404,47 @@ def test_mr_reads_fall_back_to_raw_rest_when_glab_is_missing_or_fails(gitlab, mo
             tid = kb.create_task(conn, title="fallback", completion_contract="engineering/think")
             assert kb.complete_task(conn, tid, result="done", metadata={"published_pr": mr})
             assert kb.get_task(conn, tid).status == "done"
-            assert len(gitlab["glab_calls"]()) == before  # no glab ran: the raw fallback served both reads
+            assert len(gitlab["glab_calls"]()) == before  # glab served no read: the raw fallback produced the evidence
             assert gitlab["auth"] == "Bearer gl-token"
+
+
+@pytest.mark.platforms("posix")
+def test_assigned_profile_without_gitlab_credentials_never_completes_as_the_ambient_glab(tmp_path, monkeypatch):
+    """The glab mirror of the pinned gh config dir (#122689): a profile that declares
+    no GitLab credentials of its own must not read as the launch user's glab login —
+    glab runs against its own config dir, finds no login, and the raw fallback
+    classifies auth."""
+    launch_home = tmp_path / "home"
+    launch_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+    assignee_home = launch_home / "profiles" / "b"
+    assignee_home.mkdir(parents=True)
+    (assignee_home / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("GITLAB_TOKEN", raising=False)
+    monkeypatch.setenv("GITLAB_HOST", "http://127.0.0.1:1")  # the raw fallback must refuse before it dials
+    env_dump = tmp_path / "glab_env.json"
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    glab = shim / "glab"
+    # glab semantics: a GLAB_CONFIG_DIR without a login means no credentials.
+    glab.write_text(f"#!{sys.executable}\nimport json, os, pathlib, sys\n"
+                    f"pathlib.Path({str(env_dump)!r}).write_text(json.dumps(dict(os.environ)), encoding='utf-8')\n"
+                    "if 'GLAB_CONFIG_DIR' in os.environ and not pathlib.Path(os.environ['GLAB_CONFIG_DIR']).exists():\n"
+                    "    sys.exit(1)\n"
+                    "print(json.dumps({'state': 'opened', 'diff_refs': {'head_sha': 'a' * 40},\n"
+                    " 'head_pipeline': {'id': 269000, 'sha': 'a' * 40, 'status': 'success',\n"
+                    " 'ref': 'refs/merge-requests/1867/head', 'web_url': 'u'}}))\n")
+    glab.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    kb.init_db()
+    with connect() as conn:
+        tid = kb.create_task(conn, title="as-b", completion_contract="engineering/think", assignee="b")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://gitlab.evroc.dev/engineering/think/-/merge_requests/1867"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+    assert receipt["classification"] == "auth"
+    assert "'b'" in receipt["detail"] and "GITLAB_TOKEN" in receipt["detail"]
+    captured = json.loads(env_dump.read_text(encoding="utf-8-sig"))
+    assert captured["GLAB_CONFIG_DIR"] == str(assignee_home / "glab")
+    assert "GITLAB_TOKEN" not in captured

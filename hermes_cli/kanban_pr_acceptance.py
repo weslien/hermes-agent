@@ -1,5 +1,5 @@
 """Exact-head acceptance for explicitly declared PR/MR tasks: GitHub PRs via
-``gh``, GitLab MRs via ``glab`` (raw API v4 fallback) with the assignee profile's own GITLAB_TOKEN.
+``gh``, GitLab MRs via ``glab`` (raw API v4 fallback), the assignee profile's own GitLab credentials.
 
 Network work happens outside SQLite transactions. The lifecycle owner persists
 receipts only after rechecking the captured run/status/contract under its lock.
@@ -104,11 +104,20 @@ def _gl_api(endpoint: str, *, profile_home: str | None = None):
     """GitLab API v4 mirror of :func:`_api`: :func:`_gh_env` supplies the assignee
     profile's served env — its own GITLAB_TOKEN when it declares one, the completing
     process's otherwise. ``glab api`` reads the endpoint the way ``gh`` reads GitHub;
-    the raw REST call is the fallback for a missing or failing glab, so a tokenless
-    served env still classifies `auth`, never `infra`. Credentials stay in the
-    environment, never argv, and only the HTTP code + endpoint are ever persisted."""
+    the raw REST call is the fallback for a missing or failing glab. An assigned
+    profile without GitLab credentials of its own is pinned to its own
+    GLAB_CONFIG_DIR (#122689, the glab mirror of _gh_env's GH_CONFIG_DIR pin), so
+    glab cannot read as the launch identity and a tokenless served env classifies
+    `auth`, never `infra`. Unassigned cards read with the ambient identity, as gh
+    does. Credentials stay in the environment, never argv, and only the HTTP code +
+    endpoint are ever persisted."""
     env = _gh_env(profile_home) or os.environ
     host = env.get("GITLAB_HOST", "gitlab.evroc.dev")
+    if profile_home and "GITLAB_TOKEN" not in env and "GLAB_CONFIG_DIR" not in env:
+        # glab reads its config through HOME, which stays the launch process's: pin it
+        # to a profile-owned dir so glab, like gh's exit-4, fails instead of borrowing
+        # the launch user's glab login.
+        env = {**env, "GLAB_CONFIG_DIR": str(Path(profile_home) / "glab")}
     try:
         # Pin GITLAB_HOST: glab's own default is gitlab.com, which would verify
         # evidence from a different GitLab than the fallback reads.
