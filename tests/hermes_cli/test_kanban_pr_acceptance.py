@@ -267,6 +267,22 @@ def gitlab(tmp_path, monkeypatch):
     thread.start()
     monkeypatch.setenv("GITLAB_HOST", f"http://127.0.0.1:{server.server_port}")
     monkeypatch.setenv("GITLAB_TOKEN", "gl-token")
+    # A glab shim shadows any real glab: the gate's primary transport must
+    # lend itself to a fixture exactly like gh. It dials the same local API as
+    # the raw fallback and logs every endpoint the gate routed through it.
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    calls = tmp_path / "glab_calls"
+    glab = shim / "glab"
+    glab.write_text(f"#!{sys.executable}\nimport os, sys, urllib.request\n"
+                    f"open(r'{calls}', 'a').write(sys.argv[2] + '\\n')\n"
+                    "url = os.environ['GITLAB_HOST'] + '/api/v4/' + sys.argv[2]\n"
+                    "print(urllib.request.urlopen(urllib.request.Request(url, "
+                    "headers={'Authorization': 'Bearer ' + os.environ.get('GITLAB_TOKEN', '')}))"
+                    ".read().decode())\n")
+    glab.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    state["glab_calls"] = lambda: calls.read_text().splitlines() if calls.exists() else []
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     kb.init_db()
     try:
@@ -297,6 +313,7 @@ def test_mr_completion_requires_current_pipeline_evidence(gitlab):
                 assert task.status in {"running", "ready", "blocked", "review"}
                 assert "retry" in receipt["recovery"]
         assert gitlab["auth"] == "Bearer gl-token"
+        assert gitlab["glab_calls"]()  # the reads above went through glab, not the raw fallback
         for fault, classification, key, value in (
             ("missing", "missing", "missing", True),
             ("stale_pipeline", "stale", "pipeline_sha", "b" * 40),
@@ -351,7 +368,8 @@ def test_mr_completion_requires_current_pipeline_evidence(gitlab):
 @pytest.mark.platforms("posix")
 def test_mr_acceptance_without_a_token_is_auth_not_infra(tmp_path, monkeypatch):
     """No GITLAB_TOKEN in the completing scope classifies `auth` — the mirror of
-    gh's exit-4 no-login path — and never dials (the dead host reports `infra`)."""
+    gh's exit-4 no-login path: whatever glab may try against the dead host, the
+    raw fallback refuses to dial, so the host can never report `infra`."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.delenv("GITLAB_TOKEN", raising=False)
     monkeypatch.setenv("GITLAB_HOST", "http://127.0.0.1:1")
@@ -365,3 +383,26 @@ def test_mr_acceptance_without_a_token_is_auth_not_infra(tmp_path, monkeypatch):
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "GITLAB_TOKEN" in receipt["detail"]
+
+
+@pytest.mark.platforms("linux")
+def test_mr_reads_fall_back_to_raw_rest_when_glab_is_missing_or_fails(gitlab, monkeypatch, tmp_path):
+    """A missing glab and a failing glab both fall back to the raw API v4 read:
+    the same evidence completes the card, and no glab runs."""
+    absent = tmp_path / "absent-bin"
+    broken = tmp_path / "broken-bin"
+    absent.mkdir()
+    broken.mkdir()
+    (broken / "glab").write_text(f"#!{sys.executable}\nraise SystemExit(1)\n")
+    (broken / "glab").chmod(0o755)
+    mr = "https://gitlab.evroc.dev/engineering/think/-/merge_requests/1867"
+    with connect() as conn:
+        for path_env in (str(absent), str(broken)):
+            monkeypatch.setenv("PATH", path_env)
+            gitlab.update(pipeline="success", head="a" * 40)
+            before = len(gitlab["glab_calls"]())
+            tid = kb.create_task(conn, title="fallback", completion_contract="engineering/think")
+            assert kb.complete_task(conn, tid, result="done", metadata={"published_pr": mr})
+            assert kb.get_task(conn, tid).status == "done"
+            assert len(gitlab["glab_calls"]()) == before  # no glab ran: the raw fallback served both reads
+            assert gitlab["auth"] == "Bearer gl-token"

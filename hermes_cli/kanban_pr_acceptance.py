@@ -1,5 +1,5 @@
 """Exact-head acceptance for explicitly declared PR/MR tasks: GitHub PRs via
-``gh``, GitLab MRs via API v4 with the assignee profile's own GITLAB_TOKEN.
+``gh``, GitLab MRs via ``glab`` (raw API v4 fallback) with the assignee profile's own GITLAB_TOKEN.
 
 Network work happens outside SQLite transactions. The lifecycle owner persists
 receipts only after rechecking the captured run/status/contract under its lock.
@@ -103,14 +103,25 @@ def _gh_env(profile_home: str | None) -> dict[str, str] | None:
 def _gl_api(endpoint: str, *, profile_home: str | None = None):
     """GitLab API v4 mirror of :func:`_api`: :func:`_gh_env` supplies the assignee
     profile's served env — its own GITLAB_TOKEN when it declares one, the completing
-    process's otherwise. No GITLAB_TOKEN anywhere classifies `auth`, not `infra`.
-    The token stays in this process — no argv, and only the HTTP code + endpoint are
-    ever persisted."""
+    process's otherwise. ``glab api`` reads the endpoint the way ``gh`` reads GitHub;
+    the raw REST call is the fallback for a missing or failing glab, so a tokenless
+    served env still classifies `auth`, never `infra`. Credentials stay in the
+    environment, never argv, and only the HTTP code + endpoint are ever persisted."""
     env = _gh_env(profile_home) or os.environ
+    host = env.get("GITLAB_HOST", "gitlab.evroc.dev")
+    try:
+        # Pin GITLAB_HOST: glab's own default is gitlab.com, which would verify
+        # evidence from a different GitLab than the fallback reads.
+        result = subprocess.run(["glab", "api", endpoint], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, encoding="utf-8",
+                                errors="replace", timeout=30, check=True,
+                                env={**env, "GITLAB_HOST": host})
+        return json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass  # glab missing or failed: the raw REST call below is the fallback.
     token = env.get("GITLAB_TOKEN")
     if not token:
         raise _GateAuthError(f"GITLAB_TOKEN is not set for {endpoint.split('?')[0]}")
-    host = env.get("GITLAB_HOST", "gitlab.evroc.dev")
     base = host if "://" in host else f"https://{host}"
     request = urllib.request.Request(f"{base}/api/v4/{endpoint}",
                                      headers={"Authorization": f"Bearer {token}"})
