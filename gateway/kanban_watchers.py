@@ -21,6 +21,7 @@ from gateway.kanban_watchers_common import (
     _release_singleton_lock,
     _resolve_auto_decompose_settings,
     _gc_retention_days,
+    _done_workspace_retention_days,
     _to_thread_process_service,
     logger,
 )
@@ -104,13 +105,16 @@ class GatewayKanbanWatchersMixin:
             try:
                 _gc_due = time.monotonic() >= _gc_next_at
                 _retention = 30
+                _done_ws_days = 0
                 if _gc_due:
                     _gc_next_at = time.monotonic() + _GC_INTERVAL_SECONDS
                     _retention = _gc_retention_days()
+                    _done_ws_days = _done_workspace_retention_days()
 
                 deliveries = await asyncio.to_thread(
                     _notifier_collect, self, _kb,
                     notifier_profile=notifier_profile, gc_due=_gc_due, gc_retention_days=_retention,
+                    done_ws_retention_days=_done_ws_days,
                 )
                 for d in deliveries:
                     await _KanbanNotification(

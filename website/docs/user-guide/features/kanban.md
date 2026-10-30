@@ -834,6 +834,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `auto_subscribe_on_create` | `true` | When `kanban_create` runs inside a persistent gateway/TUI session, terminal events resume that originating agent with a synthetic status turn. Set to `false` for passive completion or to require explicit `kanban_notify-subscribe` calls. Independent of `auto_decompose`. |
 | `notify_in_gateway` | `true` | Poll and deliver Kanban subscriptions from this gateway. Set to `false` on profiles that own no notification subscriptions to stop the idle five-second notifier poll. Independent of `dispatch_in_gateway`; non-dispatch gateways may still own profile-specific delivery adapters. |
 | `done_sub_retention_days` | `30` | Notify subscriptions survive `done` (reopen-safe) and are removed on `archived`. The notifier GC purges subscriptions whose task has been `done` or `blocked` with no new events for this many days, bounding sub-table growth on boards that never archive. `0` disables the sweep. |
+| `done_workspace_retention_days` | `1` | The notifier GC also collects the workspace dir of a task that has sat in `done` for more than this many days — the same safety gates as `hermes kanban gc`: never a workspace an open card or an active child still uses, shared paths deferred, managed paths only. Bounds disk growth from completed-card checkouts on boards that never archive. `0` disables the workspace sweep. |
 
 And the two auxiliary LLM slots:
 
@@ -1000,6 +1001,7 @@ hermes kanban specify [<id> | --all] [--tenant T]      # flesh out a triage-colu
         [--author NAME] [--json]                       #   into a full spec and promote to todo
 hermes kanban gc [--event-retention-days N]            # workspaces + old events + old logs
         [--log-retention-days N]                       #   (negative N is rejected; 0 disables that sweep)
+        [--done-workspace-retention-days N] [--dry-run]
 ```
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).

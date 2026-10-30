@@ -5,6 +5,8 @@ Environment variables:
     MATTERMOST_TOKEN            Bot token or personal-access token
     MATTERMOST_ALLOWED_USERS    Comma-separated user IDs
     MATTERMOST_HOME_CHANNEL     Channel ID for cron/notification delivery
+    MATTERMOST_PARTICIPATED_THREAD_CHANNELS  Channel IDs where an unmentioned reply in a
+        thread the bot already posted in still wakes the agent (comma-separated)
 """
 
 from __future__ import annotations
@@ -123,6 +125,9 @@ class MattermostAdapter(BasePlatformAdapter):
         self._last_post_status: Optional[int] = None  # POST-only, read by the broken-thread-root fallback
         self._last_post_error: str = ""
         self._dedup = MessageDeduplicator()
+        # Thread-participation admission cache (root_id -> bool). Participation is verified
+        # server-side; the cache keeps it to one API call per thread per process.
+        self._thread_participation: dict[str, bool] = {}
 
     # --- HTTP helpers ---
 
@@ -269,6 +274,48 @@ class MattermostAdapter(BasePlatformAdapter):
             return post_id
         data = await self._api_get(f"posts/{post_id}")
         return data["root_id"] if data and data.get("root_id") else post_id
+
+    async def _bot_participates_in_thread(self, root_id: str) -> bool:
+        """True if the bot itself has a post in thread ``root_id``. Bounded and shape-guarded:
+        a slow or malformed response must never stall the websocket reader or raise out of it."""
+        try:
+            data = await asyncio.wait_for(self._api_get(f"posts/{root_id}/thread"), timeout=5.0)
+        except Exception as exc:
+            logger.warning("Mattermost: thread participation check failed for %s: %s", root_id, exc)
+            return False
+        if not isinstance(data, dict):
+            return False
+        posts = data.get("posts") or {}
+        return any(isinstance(p, dict) and p.get("user_id") == self._bot_user_id for p in posts.values())
+
+    async def _participated_thread_admits(self, channel_id: str, root_id: Optional[str]) -> bool:
+        """Admission by prior participation: a non-DM message without @mention still wakes the agent
+        when its thread already contains a bot post AND the channel opted into
+        ``participated_thread_channels`` (extra key or MATTERMOST_PARTICIPATED_THREAD_CHANNELS).
+        Verification is server-side via the thread-posts API, so participation survives gateway
+        restarts with no local bookkeeping. Fails closed: API errors admit nothing. An explicit
+        ``allowed_channels`` whitelist always wins — a channel fenced out there is never admitted
+        here, even if it is listed in participated_thread_channels. Called only from the serial
+        websocket reader; repurpose under concurrency only with in-flight deduplication (the
+        bounded cache is not a lock)."""
+        if not root_id:
+            return False
+        channels = _channel_id_set(_extra_or_secret(self.config.extra,
+            "participated_thread_channels", "MATTERMOST_PARTICIPATED_THREAD_CHANNELS", blank_is_unset=False))
+        if channel_id not in channels:
+            return False
+        allowed_channels = _channel_id_set(_extra_or_secret(self.config.extra,
+            "allowed_channels", "MATTERMOST_ALLOWED_CHANNELS", blank_is_unset=False))
+        if allowed_channels and channel_id not in allowed_channels:
+            return False
+        cached = self._thread_participation.get(root_id)
+        if cached is not None:
+            return cached
+        result = await self._bot_participates_in_thread(root_id)
+        if len(self._thread_participation) >= 512:  # FIFO cap; threads are few
+            self._thread_participation.pop(next(iter(self._thread_participation)), None)
+        self._thread_participation[root_id] = result
+        return result
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: _Metadata = None) -> SendResult:
@@ -563,9 +610,16 @@ class MattermostAdapter(BasePlatformAdapter):
         channel_id, is_dm = post.get("channel_id", ""), data.get("channel_type", "O") == "D"
         message_text = post.get("message", "")
         if not is_dm:  # DMs need no gating; channels are mention-gated.
-            message_text = self._apply_channel_gating(channel_id, message_text)
-            if message_text is None:
+            gated = self._apply_channel_gating(channel_id, message_text)
+            if gated is None:
+                # Admission by prior participation: no @mention, but this thread already contains a
+                # bot post in an opted-in channel — wake without forcing the user to re-mention.
+                thread_root = post.get("root_id") or None
+                if thread_root and await self._participated_thread_admits(channel_id, thread_root):
+                    gated = message_text
+            if gated is None:
                 return
+            message_text = gated
         # Thread support: replies use root_id; in thread mode a top-level channel post is itself a valid root.
         thread_id = post.get("root_id") or None
         if not thread_id and self._reply_mode == "thread" and not is_dm and post_id:

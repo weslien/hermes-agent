@@ -474,7 +474,7 @@ def cmd_doctor(args) -> int:
     return 1 if bad else 0
 
 
-def _gc_store(store, facts) -> tuple[int, int]:
+def _gc_store(store, facts, *, dry_run: bool = False) -> tuple[int, int]:
     """The sweep core shared by `pm gc` and `pm bundle`.
 
     Removes every store entry nothing references: fetch-<sha> download-cache
@@ -482,7 +482,9 @@ def _gc_store(store, facts) -> tuple[int, int]:
     staged payload or a CI cache), orphaned package versions from an older
     lock, and expired partials. Keeps live package entries (recorded in
     facts) and partials an in-flight download still owns. Returns
-    (removed, kept).
+    (removed, kept). With ``dry_run`` the entries a real pass would remove are
+    printed and counted instead; transient recovery state (expired partials,
+    set-aside trees) is not touched.
     """
     from pm.download_state import collect_partials
     from pm import paths
@@ -497,8 +499,9 @@ def _gc_store(store, facts) -> tuple[int, int]:
         facts.forget(RETIRED_DEFAULTS)
         facts.reload()
         keep = facts.entries_in_use()
-        collect_partials(partials_dir)
-        removed += _reclaim_set_aside(store)
+        if not dry_run:
+            collect_partials(partials_dir)
+            removed += _reclaim_set_aside(store)
         for item in sorted(store.root.iterdir()):
             if not item.is_dir():
                 continue
@@ -510,29 +513,44 @@ def _gc_store(store, facts) -> tuple[int, int]:
                 continue
             if item.name in keep:
                 continue
-            print(f"removing {item.name}")
-            shutil.rmtree(item, ignore_errors=True)
+            print(f"{'would remove' if dry_run else 'removing'} {item.name}")
+            if not dry_run:
+                shutil.rmtree(item, ignore_errors=True)
             removed += 1
     return (removed, len(keep))
 
 
 def cmd_gc(args) -> int:
+    dry_run = bool(getattr(args, "dry_run", False))
     from pm.paths import writable_store_root
     from pm.lock import Facts
     from pm.store import Store
     store = Store(writable_store_root())
     facts = _facts() if store.root == _store().root else Facts(store.root / "facts.json")
-    removed, kept = _gc_store(store, facts)
+    removed, kept = _gc_store(store, facts, dry_run=dry_run)
     from hermes_cli.runtime_state import collect_generations
     from pm.environments import install_state_dir
     from pm.paths import repo_root
     from pm.runtime import collect_runtime_generations
-    generations = collect_generations(repo_root())
-    runtimes = collect_runtime_generations(install_state_dir(repo_root()) / "pm-runtime")
+    generations = collect_generations(repo_root(), dry_run=dry_run)
+    runtimes = collect_runtime_generations(install_state_dir(repo_root()) / "pm-runtime", dry_run=dry_run)
     from pm.environments import installs_root
     from pm.install_states import collect_orphan_install_states
-    orphans = collect_orphan_install_states(installs_root())
-    print(f"gc: removed {removed}, kept {kept}; removed {len(generations)} dependency generations, "
+    orphans = collect_orphan_install_states(installs_root(), dry_run=dry_run)
+    verb = "would remove" if dry_run else "removed"
+    if dry_run:
+        for generation in generations:
+            print(f"would remove dependency generation {generation.name}")
+        for runtime in runtimes:
+            print(f"would remove PM runtime generation {runtime.name}")
+        for state in orphans:
+            root = ""
+            try:
+                root = (state / "inputs" / ".project-root").read_text(encoding="utf-8-sig").strip()
+            except OSError:
+                pass
+            print(f"would remove install state {state.name} ({root or 'unknown checkout'})")
+    print(f"gc: {verb} {removed}, kept {kept}; {verb} {len(generations)} dependency generations, "
           f"{len(runtimes)} PM runtime generations, {len(orphans)} install state dir(s) of deleted checkouts")
     return 0
 
@@ -882,6 +900,9 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_repair)
 
     p = sub.add_parser("gc", help="remove store entries nothing references")
+    p.add_argument("--dry-run", action="store_true",
+                   help="list what a real pass would reclaim; remove nothing "
+                        "(coordination locks are still taken, abandoned leases pruned)")
     p.set_defaults(func=cmd_gc)
 
     p = sub.add_parser("bundle", help="stage a payload (repo+store+facts+relocatable venv) into --out")

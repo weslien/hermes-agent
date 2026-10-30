@@ -114,6 +114,18 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Parse ``trigger: <card-id>`` from a block reason so a capability block auto-releases
+# when the named card completes.  Cards match ``t_`` + hex (see ``_new_task_id``).
+_TRIGGER_RE = re.compile(r"^trigger:\s*(t_[a-fA-F0-9]+)", re.MULTILINE)
+
+
+def _extract_trigger(reason: Optional[str]) -> Optional[str]:
+    """Extract ``trigger_card_id`` from a block reason, or ``None``."""
+    if not reason:
+        return None
+    m = _TRIGGER_RE.search(reason)
+    return m.group(1) if m else None
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """``VALID_REASONING_EFFORTS`` or ``"none"`` (thinking off), case-insensitive;
@@ -637,6 +649,7 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    trigger_card_id: Optional[str] = None    # auto-release capability block when this card completes
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> Task:
@@ -669,6 +682,7 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "trigger_card_id",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -2636,6 +2650,20 @@ def _claim_is_live(trow) -> bool:
     )
 
 
+def _auto_release_capability_blocks(conn: sqlite3.Connection, completed_task_id: str) -> list[str]:
+    """Unblock capability blocks gated on the completed card."""
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'blocked' AND block_kind = 'capability' "
+        "AND trigger_card_id = ?",
+        (completed_task_id,),
+    ).fetchall()
+    released: list[str] = []
+    for row in rows:
+        if unblock_task(conn, row["id"]):
+            released.append(row["id"])
+    return released
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -2699,7 +2727,8 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL,
                        block_kind   = NULL,
-                       block_recurrences = 0
+                       block_recurrences = 0,
+                       trigger_card_id = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review')
                 """
@@ -2736,6 +2765,7 @@ def complete_task(
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
     recompute_ready(conn)  # separate txn so children see ``done``
+    _auto_release_capability_blocks(conn, task_id)
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
@@ -3158,15 +3188,16 @@ def block_task(
             if kind is None or expected_run_id is not None or _row_get(cur_row, "block_kind") is not None:
                 return False
             classified = conn.execute(
-                "UPDATE tasks SET block_kind = ?, block_recurrences = 1 "
+                "UPDATE tasks SET block_kind = ?, block_recurrences = 1, trigger_card_id = ? "
                 "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL "
                 "AND current_run_id IS NULL",
-                (kind, task_id),
+                (kind, _extract_trigger(reason), task_id),
             ).rowcount
             if classified != 1:
                 return False
             _append_event(conn, task_id, "blocked", {
                 "kind": kind, "reason": reason, "classified_in_place": True,
+                "trigger_card_id": _extract_trigger(reason),
             })
             return True
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
@@ -3182,6 +3213,7 @@ def block_task(
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            trigger_card_id=_extract_trigger(reason),
         )
         if rekind_reason:
             payload["requested_kind"] = requested_kind
@@ -3218,6 +3250,7 @@ def block_task(
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
     prev_kind: Optional[str], prev_recurrences: int,
+    trigger_card_id: Optional[str] = None,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -3233,15 +3266,19 @@ def _route_block(
     ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
     """
     payload = {"reason": reason, "kind": kind, "source_status": source_status}
+    if trigger_card_id:
+        payload["trigger_card_id"] = trigger_card_id
     if kind == "dependency":
-        return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
+        return "todo", "dependency_wait", "block_kind    = ?,\n                       trigger_card_id = ?", (kind, trigger_card_id), payload
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
-    set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
+    set_sql = "block_kind    = ?,\n                       block_recurrences = ?,\n                       trigger_card_id = ?"
     payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
+    if trigger_card_id:
+        payload["trigger_card_id"] = trigger_card_id
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
-        return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
-    return "blocked", "blocked", set_sql, (kind, recurrences), payload
+        return "triage", "block_loop_detected", set_sql, (kind, recurrences, trigger_card_id), payload
+    return "blocked", "blocked", set_sql, (kind, recurrences, trigger_card_id), payload
 
 
 def redact_review_value(value: Any) -> Any:
@@ -3585,7 +3622,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # is a fresh start for the retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, trigger_card_id = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )
         if cur.rowcount != 1:

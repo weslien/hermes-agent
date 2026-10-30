@@ -9,6 +9,51 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
+from hermes_cli.kanban_pr_acceptance import _PR, _MR, _match_pr
+
+
+def test_pr_regex_captures_owner_repo_and_number():
+    """GitHub pull-request URLs: the path before /pull/N is the repo pair."""
+    m = _PR.fullmatch("https://github.com/acme/repo/pull/7")
+    assert m is not None
+    assert m.group(1) == "acme/repo"
+    assert m.group(2) == "7"
+    assert _PR.fullmatch("https://github.com/a-org/a-repo/pull/1234") is not None
+    # Leading zeros and zero are not accepted PR numbers.
+    assert _PR.fullmatch("https://github.com/acme/repo/pull/0") is None
+    assert _PR.fullmatch("https://github.com/acme/repo/pull/07") is None
+
+
+def test_mr_regex_captures_nested_path_and_iid():
+    """GitLab merge-request URLs: the path before /-/merge_requests/N captures
+    the full group-and-project, including nested groups."""
+    m = _MR.fullmatch("https://gitlab.evroc.dev/engineering/think/-/merge_requests/1867")
+    assert m is not None
+    assert m.group(1) == "engineering/think"
+    assert m.group(2) == "1867"
+    m = _MR.fullmatch("https://gitlab.evroc.dev/group/sub/repo/-/merge_requests/12")
+    assert m is not None
+    assert m.group(1) == "group/sub/repo"
+    assert m.group(2) == "12"
+    # Leading zeros and zero are not accepted MR numbers.
+    assert _MR.fullmatch("https://gitlab.evroc.dev/g/p/-/merge_requests/0") is None
+    assert _MR.fullmatch("https://gitlab.evroc.dev/g/p/-/merge_requests/012") is None
+
+
+def test_match_pr_returns_none_for_unrelated_urls():
+    """Any URL that is not a GitHub pull request or a GitLab merge request is rejected."""
+    for unrelated in (
+            "https://github.com/acme/repo/issues/7",
+            "https://github.com/acme/repo/pull/",
+            "https://gitlab.evroc.dev/engineering/think/-/issues/5",
+            "https://gitlab.evroc.dev/engineering/think/merge_requests/5",
+            "https://bitbucket.org/acme/repo/pull/7",
+            "https://gitlab.com/other/repo/-/merge_requests/1",
+            "not a url",
+            "",
+    ):
+        assert _match_pr(unrelated) is None
+    assert _match_pr(None) is None
 
 
 @pytest.fixture
@@ -230,3 +275,221 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+# --- GitLab MR acceptance: same gate, GitLab API v4 + the head pipeline as the required check ---
+
+@pytest.fixture
+def gitlab(tmp_path, monkeypatch):
+    state = {"pipeline": "success", "head": "a" * 40, "reads": 0, "requests": [], "auth": None}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            state["requests"].append(self.path)
+            state["reads"] += 1
+            state["auth"] = self.headers.get("Authorization")
+            if "/merge_requests/" not in self.path:
+                self.send_error(404)
+                return
+            pipeline = None if state.get("missing") else {
+                "id": 269000, "sha": state.get("pipeline_sha", state["head"]),
+                "status": state["pipeline"], "ref": state.get("ref", "refs/merge-requests/1867/head"),
+                "web_url": "https://gitlab.evroc.dev/engineering/think/-/pipelines/269000"}
+            value = {"state": state.get("mr_state", "opened"),
+                     "diff_refs": {"head_sha": state["head"]},
+                     "head_pipeline": pipeline, "pipeline": pipeline}
+            if state.get("head_change") and state["reads"] > 1:
+                value["diff_refs"] = {"head_sha": "b" * 40}
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(value).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("GITLAB_HOST", f"http://127.0.0.1:{server.server_port}")
+    monkeypatch.setenv("GITLAB_TOKEN", "gl-token")
+    # A glab shim shadows any real glab: the gate's primary transport must
+    # lend itself to a fixture exactly like gh. It dials the same local API as
+    # the raw fallback and logs every endpoint the gate routed through it.
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    calls = tmp_path / "glab_calls"
+    glab = shim / "glab"
+    glab.write_text(f"#!{sys.executable}\nimport os, sys, urllib.request\n"
+                    f"open(r'{calls}', 'a').write(sys.argv[2] + '\\n')\n"
+                    "url = os.environ['GITLAB_HOST'] + '/api/v4/' + sys.argv[2]\n"
+                    "print(urllib.request.urlopen(urllib.request.Request(url, "
+                    "headers={'Authorization': 'Bearer ' + os.environ.get('GITLAB_TOKEN', '')}))"
+                    ".read().decode())\n")
+    glab.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    state["glab_calls"] = lambda: calls.read_text().splitlines() if calls.exists() else []
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    kb.init_db()
+    try:
+        yield state
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+@pytest.mark.platforms("linux")
+def test_mr_completion_requires_current_pipeline_evidence(gitlab):
+    with connect() as conn:
+        mr = "https://gitlab.evroc.dev/engineering/think/-/merge_requests/1867"
+        for pipeline in ("failed", "running", "canceled", "skipped", "success"):
+            gitlab.update(pipeline=pipeline, head="a" * 40)
+            tid = kb.create_task(conn, title="Publish", completion_contract="engineering/think")
+            ok = kb.complete_task(conn, tid, result="done", metadata={"published_pr": mr})
+            assert ok is (pipeline == "success")
+            task = kb.get_task(conn, tid)
+            assert (task.status == "done") is ok
+            receipt = json.loads(conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+            assert receipt["head_sha"] == "a" * 40
+            assert receipt["checks"][-1]["url"].endswith("/pipelines/269000")
+            assert receipt["ok"] is ok
+            if not ok:
+                assert task.status in {"running", "ready", "blocked", "review"}
+                assert "retry" in receipt["recovery"]
+        assert gitlab["auth"] == "Bearer gl-token"
+        assert gitlab["glab_calls"]()  # the reads above went through glab, not the raw fallback
+        for fault, classification, key, value in (
+            ("missing", "missing", "missing", True),
+            ("stale_pipeline", "stale", "pipeline_sha", "b" * 40),
+            ("head_change", "stale", "head_change", True),
+            ("mr_closed", "infra", "mr_state", "closed"),
+        ):
+            gitlab.update(pipeline="success", head="a" * 40)
+            gitlab[key] = value
+            tid = kb.create_task(conn, title=fault, completion_contract="engineering/think")
+            assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": mr})
+            receipt = json.loads(conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+            assert receipt["classification"] == classification
+            if fault == "missing":
+                assert "No pipeline" in receipt["detail"]
+            assert kb.get_task(conn, tid).status != "done"
+            gitlab.pop(key)
+        # A sibling project and an omitted published_pr cannot satisfy the declaration,
+        # and the mismatch is refused before any API read.
+        before = len(gitlab["requests"])
+        tid = kb.create_task(conn, title="sibling", completion_contract="engineering/think")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://gitlab.evroc.dev/other/repo/-/merge_requests/7"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+        assert receipt["classification"] == "missing"
+        assert receipt["detail"] == "Supply metadata.published_pr matching the persisted completion contract."
+        assert len(gitlab["requests"]) == before
+        assert not kb.complete_task(conn, tid, result="done")
+        # A merged-result pipeline (temp merge ref, sha != source HEAD) must satisfy the gate.
+        gitlab.update(pipeline="success", head="a" * 40)
+        gitlab["pipeline_sha"] = "c" * 40
+        gitlab["ref"] = "refs/merge-requests/1867/merge"
+        tid = kb.create_task(conn, title="merged-result", completion_contract="engineering/think")
+        assert kb.complete_task(conn, tid, result="done", metadata={"published_pr": mr})
+        assert kb.get_task(conn, tid).status == "done"
+        gitlab.pop("pipeline_sha")
+        gitlab.pop("ref")
+        # Nested groups declare the exact MR URL itself.
+        nested = "https://gitlab.evroc.dev/group/sub/repo/-/merge_requests/12"
+        gitlab.update(pipeline="success", head="a" * 40)
+        tid = kb.create_task(conn, title="nested", completion_contract=nested)
+        assert kb.complete_task(conn, tid, result="done", metadata={"published_pr": nested})
+        assert kb.get_task(conn, tid).status == "done"
+        # Local-only contracts never touch the network, MR URL in prose or not.
+        before = len(gitlab["requests"])
+        local = kb.create_task(conn, title="local", completion_contract="local-only")
+        assert kb.complete_task(conn, local, summary=f"{mr} is background context")
+        assert len(gitlab["requests"]) == before
+
+
+@pytest.mark.platforms("posix")
+def test_mr_acceptance_without_a_token_is_auth_not_infra(tmp_path, monkeypatch):
+    """No GITLAB_TOKEN in the completing scope classifies `auth` — the mirror of
+    gh's exit-4 no-login path: whatever glab may try against the dead host, the
+    raw fallback refuses to dial, so the host can never report `infra`."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("GITLAB_TOKEN", raising=False)
+    monkeypatch.setenv("GITLAB_HOST", "http://127.0.0.1:1")
+    project = "engineering/think"
+    kb.init_db()
+    with connect() as conn:
+        tid = kb.create_task(conn, title="tokenless", completion_contract=project)
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://gitlab.evroc.dev/engineering/think/-/merge_requests/1867"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+    assert receipt["classification"] == "auth"
+    assert "GITLAB_TOKEN" in receipt["detail"]
+
+
+@pytest.mark.platforms("linux")
+def test_mr_reads_fall_back_to_raw_rest_when_glab_is_missing_or_fails(gitlab, monkeypatch, tmp_path):
+    """A missing glab and a failing glab both fall back to the raw API v4 read:
+    the same evidence completes the card, and no glab runs."""
+    absent = tmp_path / "absent-bin"
+    broken = tmp_path / "broken-bin"
+    absent.mkdir()
+    broken.mkdir()
+    (broken / "glab").write_text(f"#!{sys.executable}\nraise SystemExit(1)\n")
+    (broken / "glab").chmod(0o755)
+    mr = "https://gitlab.evroc.dev/engineering/think/-/merge_requests/1867"
+    with connect() as conn:
+        for path_env in (str(absent), str(broken)):
+            monkeypatch.setenv("PATH", path_env)
+            gitlab.update(pipeline="success", head="a" * 40)
+            before = len(gitlab["glab_calls"]())
+            tid = kb.create_task(conn, title="fallback", completion_contract="engineering/think")
+            assert kb.complete_task(conn, tid, result="done", metadata={"published_pr": mr})
+            assert kb.get_task(conn, tid).status == "done"
+            assert len(gitlab["glab_calls"]()) == before  # glab served no read: the raw fallback produced the evidence
+            assert gitlab["auth"] == "Bearer gl-token"
+
+
+@pytest.mark.platforms("posix")
+def test_assigned_profile_without_gitlab_credentials_never_completes_as_the_ambient_glab(tmp_path, monkeypatch):
+    """The glab mirror of the pinned gh config dir (#122689): a profile that declares
+    no GitLab credentials of its own must not read as the launch user's glab login —
+    glab runs against its own config dir, finds no login, and the raw fallback
+    classifies auth."""
+    launch_home = tmp_path / "home"
+    launch_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+    assignee_home = launch_home / "profiles" / "b"
+    assignee_home.mkdir(parents=True)
+    (assignee_home / ".env").write_text("", encoding="utf-8")
+    monkeypatch.delenv("GITLAB_TOKEN", raising=False)
+    monkeypatch.setenv("GITLAB_HOST", "http://127.0.0.1:1")  # the raw fallback must refuse before it dials
+    env_dump = tmp_path / "glab_env.json"
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    glab = shim / "glab"
+    # glab semantics: a GLAB_CONFIG_DIR without a login means no credentials.
+    glab.write_text(f"#!{sys.executable}\nimport json, os, pathlib, sys\n"
+                    f"pathlib.Path({str(env_dump)!r}).write_text(json.dumps(dict(os.environ)), encoding='utf-8')\n"
+                    "if 'GLAB_CONFIG_DIR' in os.environ and not pathlib.Path(os.environ['GLAB_CONFIG_DIR']).exists():\n"
+                    "    sys.exit(1)\n"
+                    "print(json.dumps({'state': 'opened', 'diff_refs': {'head_sha': 'a' * 40},\n"
+                    " 'head_pipeline': {'id': 269000, 'sha': 'a' * 40, 'status': 'success',\n"
+                    " 'ref': 'refs/merge-requests/1867/head', 'web_url': 'u'}}))\n")
+    glab.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
+    kb.init_db()
+    with connect() as conn:
+        tid = kb.create_task(conn, title="as-b", completion_contract="engineering/think", assignee="b")
+        assert not kb.complete_task(conn, tid, result="done",
+                                    metadata={"published_pr": "https://gitlab.evroc.dev/engineering/think/-/merge_requests/1867"})
+        receipt = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
+    assert receipt["classification"] == "auth"
+    assert "'b'" in receipt["detail"] and "GITLAB_TOKEN" in receipt["detail"]
+    captured = json.loads(env_dump.read_text(encoding="utf-8-sig"))
+    assert captured["GLAB_CONFIG_DIR"] == str(assignee_home / "glab")
+    assert "GITLAB_TOKEN" not in captured

@@ -97,6 +97,18 @@ def _gc_retention_days() -> int:
         return 30
 
 
+def _done_workspace_retention_days() -> int:
+    """``kanban.done_workspace_retention_days`` (default 1; 0 disables), re-read per
+    sweep; fails safe to 0 — an unreadable or negative config must not drive deletion
+    (max() clamps negative values to the "off" floor, never to a future cutoff)."""
+    try:
+        from hermes_cli.config import load_config
+
+        return max(0, int(((load_config() or {}).get("kanban") or {}).get("done_workspace_retention_days", 1)))
+    except Exception:  # health: allow BLE001 -- an unreadable config must fail safe to 0, never drive deletion
+        return 0
+
+
 def _kanban_dispatch_allowed() -> bool:
     """False while the global emergency stop (`hermes pause`) is engaged.
 

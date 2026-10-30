@@ -38,9 +38,11 @@ def _old_log_file() -> Path:
     os.utime(p, (0, 0))
     return p
 
-def _args(event_days=30, log_days=30):
+def _args(event_days=30, log_days=30, done_ws_days=1, dry_run=False):
     return argparse.Namespace(event_retention_days=event_days,
-                              log_retention_days=log_days)
+                              log_retention_days=log_days,
+                              done_workspace_retention_days=done_ws_days,
+                              dry_run=dry_run)
 
 def test_gc_events_rejects_negative_window(board):
     with kbc.connect_closing() as conn:
@@ -179,7 +181,6 @@ def test_cmd_gc_keeps_a_scratch_dir_a_live_task_still_uses(board):
 def test_cleanup_workspace_keeps_scratch_when_other_boards_cannot_be_listed(board, monkeypatch):
     """A named board's live task uses the dir; if boards cannot be listed, refuse the delete."""
     from hermes_cli import kanban_db_workspace as kbw
-
     kb.create_board("other")
     shared = kb.workspaces_root() / "cross-board"
     shared.mkdir(parents=True)
@@ -221,3 +222,176 @@ def test_cleanup_workspace_keeps_scratch_when_other_boards_cannot_be_listed(boar
         kbw._cleanup_workspace(conn, archived)
         assert _deferred_reasons(conn, archived) == ["shared", "shared", "unknown"]
     assert (shared / "note.txt").read_text(encoding="utf-8") == "still needed"
+
+
+def _done_scratch_workspace(conn, *, completed_at: int, title="done with workspace") -> Path:
+    tid = kb.create_task(conn, title=title)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='done', completed_at=?, workspace_kind='scratch' WHERE id=?",
+            (completed_at, tid),
+        )
+    ws = kb.workspaces_root() / tid
+    ws.mkdir(parents=True)
+    (ws / "done.txt").write_text("candidate", encoding="utf-8")
+    return ws
+
+
+def test_cmd_gc_done_workspace_retention_bounds(board):
+    import time as _time
+
+    with kbc.connect_closing() as conn:
+        old = _done_scratch_workspace(conn, completed_at=0)
+        fresh = _done_scratch_workspace(conn, completed_at=int(_time.time()))
+        # A done row with no completion stamp must never match the cutoff.
+        undated = kb.create_task(conn, title="done, no completion stamp")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', workspace_kind='scratch' WHERE id=?",
+                (undated,),
+            )
+        undated_ws = kb.workspaces_root() / undated
+        undated_ws.mkdir(parents=True)
+        (undated_ws / "undated.txt").write_text("no stamp", encoding="utf-8")
+        open_tid = kb.create_task(conn, title="still open")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='running', workspace_kind='scratch' WHERE id=?",
+                (open_tid,),
+            )
+        open_ws = kb.workspaces_root() / open_tid
+        open_ws.mkdir(parents=True)
+        (open_ws / "live.txt").write_text("in use", encoding="utf-8")
+    # 0 disables the done sweep: every workspace survives.
+    assert kanban_ops._cmd_gc(_args(done_ws_days=0)) == 0
+    assert old.is_dir() and fresh.is_dir() and undated_ws.is_dir() and open_ws.is_dir()
+    # 1 day: only the done workspace past the grace window goes; a done row with
+    # no completed_at stamp never matches the cutoff, and open cards are untouchable.
+    assert kanban_ops._cmd_gc(_args(done_ws_days=1)) == 0
+    assert not old.exists() and fresh.is_dir() and undated_ws.is_dir() and open_ws.is_dir()
+
+
+def test_cmd_gc_defers_a_done_workspace_with_active_children(board):
+    with kbc.connect_closing() as conn:
+        parent = kb.create_task(conn, title="done parent")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', completed_at=0, workspace_kind='scratch' WHERE id=?",
+                (parent,),
+            )
+        ws = kb.workspaces_root() / parent
+        ws.mkdir(parents=True)
+        (ws / "handoff.md").write_text("child still needs this", encoding="utf-8")
+        child = kb.create_task(conn, title="active child")
+        kb.link_tasks(conn, parent, child)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='running' WHERE id=?", (child,))
+    assert kanban_ops._cmd_gc(_args()) == 0
+    assert (ws / "handoff.md").exists()
+    # Every child terminal: nothing reads the handoff any more, the old workspace goes.
+    with kbc.connect_closing() as conn, kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='done', completed_at=0 WHERE id=?", (child,))
+    assert kanban_ops._cmd_gc(_args()) == 0
+    assert not ws.exists()
+
+
+def test_cmd_gc_dry_run_lists_and_removes_nothing(board, capsys):
+    with kbc.connect_closing() as conn:
+        done = _done_scratch_workspace(conn, completed_at=0)
+        arch = _archived_scratch_workspace(conn)
+        tid = _done_task_with_old_event(conn)
+        # A worktree-kind row whose path is not a linked worktree: the real
+        # pass preserves it, so the preview must not list it either.
+        fake_wt = kb.create_task(conn, title="done, not a worktree")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', completed_at=0, workspace_kind='worktree', "
+                "workspace_path=? WHERE id=?",
+                (str(kb.workspaces_root() / "fake-worktree-dir"), fake_wt),
+            )
+        fake_dir = kb.workspaces_root() / "fake-worktree-dir"
+        fake_dir.mkdir(parents=True)
+        (fake_dir / "marker.txt").write_text("not a git worktree", encoding="utf-8")
+    log = _old_log_file()
+
+    assert kanban_ops._cmd_gc(_args(dry_run=True)) == 0
+    out = capsys.readouterr().out
+    assert "would remove workspace of" in out
+    assert done.name in out and arch.name in out
+    assert fake_dir.name not in out
+    assert done.is_dir() and arch.is_dir() and fake_dir.is_dir() and log.exists()
+    with kbc.connect_closing() as conn:
+        assert _event_rows(conn, tid) > 0
+
+    # The same state is really collected: workspaces, events, and the old log.
+    assert kanban_ops._cmd_gc(_args()) == 0
+    assert not done.exists() and not arch.exists() and fake_dir.is_dir() and not log.exists()
+    with kbc.connect_closing() as conn:
+        assert _event_rows(conn, tid) == 0
+
+
+def test_gc_terminal_workspaces_done_requires_an_age_bound(board):
+    """Without ``completed_before`` a done sweep would collect every done card's
+    workspace regardless of age; the function must refuse that call shape."""
+    from hermes_cli import kanban_db_workspace as kbw
+
+    with kbc.connect_closing() as conn:
+        with pytest.raises(ValueError):
+            kbw.gc_terminal_workspaces(conn, status="done")
+        # The archived sweep keeps its no-bound shape (every archived card).
+        assert kbw.gc_terminal_workspaces(conn, status="archived") == []
+
+
+def test_cmd_gc_dry_run_skips_a_worktree_it_cannot_evaluate(board, monkeypatch, capsys):
+    """A candidate worktree the preserve predicate cannot even evaluate must
+    skip its row, not abort the preview; the real pass is armed the same way."""
+    from hermes_cli import kanban_db_workspace as kbw
+
+    def _raise(wp):
+        raise OSError("unreadable")
+
+    monkeypatch.setattr(kbw, "_worktree_preserve_reason", _raise)
+    with kbc.connect_closing() as conn:
+        done = _done_scratch_workspace(conn, completed_at=0)
+        wt_task = kb.create_task(conn, title="done with worktree")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='done', completed_at=0, workspace_kind='worktree', "
+                "workspace_path=? WHERE id=?",
+                (str(kb.workspaces_root() / "opaque-worktree"), wt_task),
+            )
+        (kb.workspaces_root() / "opaque-worktree").mkdir(parents=True)
+
+    assert kanban_ops._cmd_gc(_args(dry_run=True)) == 0
+    out = capsys.readouterr().out
+    assert done.name in out                        # scratch rows still previewed
+    assert "opaque-worktree" not in out            # unreadable candidate skipped, not listed
+    assert (kb.workspaces_root() / "opaque-worktree").is_dir()
+
+    # The real pass is armored the same way: the unreadable worktree survives it.
+    assert kanban_ops._cmd_gc(_args()) == 0
+    assert (kb.workspaces_root() / "opaque-worktree").is_dir()
+    assert not done.exists()
+
+
+def test_done_workspace_retention_config_default_and_reader(board):
+    """The knob is registered (``DEFAULT_CONFIG``) and the notifier's reader
+    honours a user config.yaml through the same loader the watcher uses."""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    from gateway.kanban_watchers_common import _done_workspace_retention_days
+
+    default_days = DEFAULT_CONFIG["kanban"]["done_workspace_retention_days"]
+    assert isinstance(default_days, int) and default_days >= 0
+    # Nothing configured: the reader returns the shipped default.
+    assert _done_workspace_retention_days() == default_days
+    # A user-set config reaches the sweep through the real loader.
+    home = Path(os.environ["HERMES_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "kanban:\n  done_workspace_retention_days: 5\n", encoding="utf-8")
+    assert _done_workspace_retention_days() == 5
+    # A negative value would build a future cutoff and sweep every done card
+    # at once; the reader must clamp it to "off" instead of trusting it.
+    (home / "config.yaml").write_text(
+        "kanban:\n  done_workspace_retention_days: -3\n", encoding="utf-8")
+    assert _done_workspace_retention_days() == 0

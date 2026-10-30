@@ -252,6 +252,96 @@ def _defer_shared_worktree_cleanup(
     )
 
 
+def gc_terminal_workspaces(
+    conn: sqlite3.Connection, *, status: str,
+    completed_before: Optional[int] = None, board: Optional[str] = None,
+    dry_run: bool = False,
+) -> list[tuple[str, str]]:
+    """Collect one terminal status's workspace rows: ``hermes kanban gc`` and the
+    notifier's hourly sweep (``gateway/kanban_watchers_notifier.py``).
+
+    Rows are tasks with *status* (the ``archived`` sweep has no age filter), or
+    ``done`` rows with ``completed_at <= completed_before`` (epoch seconds).
+    Same safety predicates as completion-time cleanup (#28818, #33774): managed
+    scratch paths only, deferral while another live task shares the path, deferral
+    while any child is still non-terminal (a child may still read handoff
+    artifacts from this workspace), worktrees clean+fully-pushed only; any doubt
+    keeps the dir. A dry run never writes: no removal, no defer event.
+
+    Returns ``(task id, workspace path)`` pairs — removed, or due in a dry run.
+    """
+    if status == "done" and completed_before is None:
+        # A done sweep is defined by its grace window; without a bound it would
+        # collect every done card's workspace regardless of age.
+        raise ValueError("gc_terminal_workspaces: completed_before is required when status is 'done'")
+    scratch_root = _kb.workspaces_root(board)
+    where = "status = ?"
+    params: tuple = (status,)
+    if completed_before is not None:
+        where += " AND completed_at IS NOT NULL AND completed_at <= ?"
+        params += (completed_before,)
+    rows = conn.execute(
+        "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
+        f"WHERE {where}", params,
+    ).fetchall()
+    collected: list[tuple[str, str]] = []
+    for row in rows:
+        tid = row["id"]
+        if _has_active_children(conn, tid):
+            continue
+        if row["workspace_kind"] == "worktree":
+            # Backstop for worktrees that escaped the completion/archive hook.
+            wt_path = row["workspace_path"]
+            if wt_path and Path(wt_path).is_dir():
+                if dry_run:
+                    if _workspace_in_use_by_other(conn, tid, wt_path) is not None:
+                        continue
+                    # Same preserve predicate the real removal runs below, so the
+                    # preview lists only worktrees a real pass can really collect.
+                    # Armored like that removal: one unreadable candidate skips its
+                    # row, it never aborts the preview.
+                    try:
+                        reason, _ = _worktree_preserve_reason(Path(wt_path))
+                    except Exception as exc:  # health: allow BLE001 -- one unreadable candidate skips its row; the preview must never abort
+                        _kb._log.warning(
+                            "gc dry-run: skipping worktree %s (cannot evaluate): %s",
+                            wt_path, exc,
+                        )
+                        continue
+                    if not reason:
+                        collected.append((tid, wt_path))
+                    continue
+                if _defer_shared_worktree_cleanup(conn, tid, wt_path):
+                    continue
+                _cleanup_worktree_workspace(tid, wt_path, row["branch_name"])
+                if not Path(wt_path).is_dir():
+                    collected.append((tid, wt_path))
+            continue
+        if row["workspace_kind"] != "scratch":
+            continue
+        path = Path(row["workspace_path"] or (scratch_root / tid))
+        # Same containment predicate as completion cleanup (#28818): strictly below a
+        # managed root, never the root itself (which holds every task's scratch dir).
+        # Cheap existence/symlink check first: most rows were already cleaned at
+        # completion, and rmtree refuses a symlink (so it must not be counted).
+        if not path.is_dir() or path.is_symlink() or not _is_managed_scratch_path(path):
+            continue
+        # dry-run mode: the same check the defer helper uses, without the event write.
+        if dry_run:
+            if _workspace_in_use_by_other(conn, tid, path) is not None:
+                continue
+        elif _defer_shared_workspace_cleanup(conn, tid, path):
+            continue
+        else:
+            shutil.rmtree(path, ignore_errors=True)
+            if path.is_dir():
+                _kb._log.debug(
+                    "gc terminal workspaces: %s was recreated under the removal; left for the next pass", path)
+                continue
+        collected.append((tid, str(path)))
+    return collected
+
+
 def _lexical_path(path: Path | str) -> Path:
     """Absolute, ``..``-collapsed, NFC form of *path* WITHOUT following symlinks."""
     return Path(_path_key(os.path.abspath(path)))
@@ -423,6 +513,25 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         pass  # best-effort — never block completion
 
 
+def _worktree_preserve_reason(wp: Path) -> tuple[Optional[str], Optional[Path]]:
+    """Why :func:`_cleanup_worktree_workspace` would keep *wp*, and the repo root
+    of the linked worktree (None alongside a reason). gc's dry-run uses the same
+    predicate so the preview lists only paths a real pass can really collect."""
+    try:
+        from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
+    except Exception:  # health: allow BLE001 -- predicates unavailable means preserve, never guess
+        return "unavailable", None  # CLI safety predicates unavailable — preserve
+    common = _git_common_dir(wp)
+    if common is None or common.name != ".git":
+        return "not-worktree", None  # not a linked worktree of a normal repo — never guess
+    repo_root = common.parent
+    if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
+        return "main-checkout", repo_root  # never remove the main checkout
+    if _worktree_is_dirty(str(wp), str(repo_root)) or _worktree_has_unpushed_commits(str(wp)):
+        return "dirty-or-unpushed", repo_root
+    return None, repo_root  # a clean, fully pushed linked worktree — removable
+
+
 def _cleanup_worktree_workspace(
     task_id: str, path: str, branch_name: Optional[str] = None
 ) -> None:
@@ -433,24 +542,16 @@ def _cleanup_worktree_workspace(
     it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
     branches are kept. Best-effort."""
     try:
-        from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
-    except Exception:
-        return  # CLI safety predicates unavailable — preserve
-    try:
         wp = Path(path).expanduser()
         if not wp.is_dir():
             return
-        common = _git_common_dir(wp)
-        if common is None or common.name != ".git":
-            return  # not a linked worktree of a normal repo — never guess
-        repo_root = common.parent
-        if _path_key(wp.resolve(strict=False)) == _path_key(repo_root.resolve(strict=False)):
-            return  # never remove the main checkout
-        if _worktree_is_dirty(str(wp), str(repo_root)) or _worktree_has_unpushed_commits(str(wp)):
-            _kb._log.info(
-                "Preserving worktree for task %s: dirty or unpushed work at %s",
-                task_id, wp,
-            )
+        reason, repo_root = _worktree_preserve_reason(wp)
+        if reason or repo_root is None:
+            if reason == "dirty-or-unpushed":
+                _kb._log.info(
+                    "Preserving worktree for task %s: dirty or unpushed work at %s",
+                    task_id, wp,
+                )
             return
         # Windows cannot delete a directory while this process has its current
         # directory inside it. Completed workers normally run from their own

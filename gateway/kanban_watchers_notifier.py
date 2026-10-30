@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+import time
 from functools import partial
 from pathlib import Path
 import weakref
@@ -226,12 +227,14 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
 class _Collector:
     """One tick's claim state: which profiles/platforms this gateway serves and the GC gate."""
 
-    def __init__(self, runner: Any, kb: Any, *, notifier_profile: Optional[str], gc_due: bool, gc_retention_days: int) -> None:
+    def __init__(self, runner: Any, kb: Any, *, notifier_profile: Optional[str], gc_due: bool,
+                 gc_retention_days: int, done_ws_retention_days: int = 0) -> None:
         self.runner = runner
         self.kb = kb
         self.notifier_profile = notifier_profile
         self.gc_due = gc_due
         self.gc_retention_days = gc_retention_days
+        self.done_ws_retention_days = done_ws_retention_days
         self.deliveries: list[dict] = []
         self.include_unowned = runner._owns_kanban_dispatcher_lock()
         self.profile_adapters = getattr(runner, "_profile_adapters", {})
@@ -299,6 +302,27 @@ class _Collector:
         except Exception as _gc_exc:
             logger.debug("kanban notifier: stale-sub GC failed for board %s: %s", slug, _gc_exc)
 
+    def _gc_done_workspaces(self, conn: Any, slug: str) -> None:
+        """Best-effort retention sweep of old done tasks' workspaces on one board.
+
+        Same predicates as ``hermes kanban gc`` (never an open card's or an active
+        child's workspace, shared paths deferred), so the hourly tick bounds
+        workspace growth on boards that never archive. A failed sweep never blocks
+        delivery; the next hourly gate retries.
+        """
+        try:
+            from hermes_cli import kanban_db_workspace
+            _collected = kanban_db_workspace.gc_terminal_workspaces(
+                conn, status="done",
+                completed_before=int(time.time()) - self.done_ws_retention_days * 24 * 3600,
+                board=slug,
+            )
+            if _collected:
+                logger.info("kanban notifier: collected %d done-task workspace(s) on board %s (retention %dd)",
+                            len(_collected), slug, self.done_ws_retention_days)
+        except Exception as _gc_exc:  # health: allow BLE001 -- a failed sweep never blocks delivery, mirrors _gc_stale_subs
+            logger.debug("kanban notifier: done-workspace GC failed for board %s: %s", slug, _gc_exc)
+
     def _claim_for_sub(self, conn: Any, slug: str, sub: dict) -> Optional[dict]:
         """Claim one subscription's unseen events; None when skipped or nothing new."""
         owner_profile = sub.get("notifier_profile") or None
@@ -334,6 +358,8 @@ class _Collector:
         try:
             if self.gc_due:
                 self._gc_stale_subs(conn, slug)
+                if self.done_ws_retention_days:
+                    self._gc_done_workspaces(conn, slug)
             # No explicit init_db(): connect() already runs the migration once per
             # process, and init_db() would re-run it on a second connection racing
             # the first.
@@ -353,7 +379,8 @@ class _Collector:
             conn.close()
 
 
-def _notifier_collect(runner: Any, kb: Any, *, notifier_profile: Optional[str], gc_due: bool, gc_retention_days: int) -> list[dict]:
+def _notifier_collect(runner: Any, kb: Any, *, notifier_profile: Optional[str], gc_due: bool,
+                      gc_retention_days: int, done_ws_retention_days: int = 0) -> list[dict]:
     """Claim unseen terminal events for every owned subscription on every board.
 
     Each gateway polls only subscriptions owned by profiles whose adapters it
@@ -362,6 +389,7 @@ def _notifier_collect(runner: Any, kb: Any, *, notifier_profile: Optional[str], 
     """
     return _Collector(
         runner, kb, notifier_profile=notifier_profile, gc_due=gc_due, gc_retention_days=gc_retention_days,
+        done_ws_retention_days=done_ws_retention_days,
     ).collect()
 
 
