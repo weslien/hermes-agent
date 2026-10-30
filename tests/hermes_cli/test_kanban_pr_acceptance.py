@@ -9,6 +9,51 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
+from hermes_cli.kanban_pr_acceptance import _PR, _MR, _match_pr
+
+
+def test_pr_regex_captures_owner_repo_and_number():
+    """GitHub pull-request URLs: the path before /pull/N is the repo pair."""
+    m = _PR.fullmatch("https://github.com/acme/repo/pull/7")
+    assert m is not None
+    assert m.group(1) == "acme/repo"
+    assert m.group(2) == "7"
+    assert _PR.fullmatch("https://github.com/a-org/a-repo/pull/1234") is not None
+    # Leading zeros and zero are not accepted PR numbers.
+    assert _PR.fullmatch("https://github.com/acme/repo/pull/0") is None
+    assert _PR.fullmatch("https://github.com/acme/repo/pull/07") is None
+
+
+def test_mr_regex_captures_nested_path_and_iid():
+    """GitLab merge-request URLs: the path before /-/merge_requests/N captures
+    the full group-and-project, including nested groups."""
+    m = _MR.fullmatch("https://gitlab.evroc.dev/engineering/think/-/merge_requests/1867")
+    assert m is not None
+    assert m.group(1) == "engineering/think"
+    assert m.group(2) == "1867"
+    m = _MR.fullmatch("https://gitlab.evroc.dev/group/sub/repo/-/merge_requests/12")
+    assert m is not None
+    assert m.group(1) == "group/sub/repo"
+    assert m.group(2) == "12"
+    # Leading zeros and zero are not accepted MR numbers.
+    assert _MR.fullmatch("https://gitlab.evroc.dev/g/p/-/merge_requests/0") is None
+    assert _MR.fullmatch("https://gitlab.evroc.dev/g/p/-/merge_requests/012") is None
+
+
+def test_match_pr_returns_none_for_unrelated_urls():
+    """Any URL that is not a GitHub pull request or a GitLab merge request is rejected."""
+    for unrelated in (
+            "https://github.com/acme/repo/issues/7",
+            "https://github.com/acme/repo/pull/",
+            "https://gitlab.evroc.dev/engineering/think/-/issues/5",
+            "https://gitlab.evroc.dev/engineering/think/merge_requests/5",
+            "https://bitbucket.org/acme/repo/pull/7",
+            "https://gitlab.com/other/repo/-/merge_requests/1",
+            "not a url",
+            "",
+    ):
+        assert _match_pr(unrelated) is None
+    assert _match_pr(None) is None
 
 
 @pytest.fixture
