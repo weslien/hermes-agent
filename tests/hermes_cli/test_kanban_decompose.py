@@ -256,27 +256,6 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
-def test_decompose_parks_needs_input_block_loop(kanban_home):
-    """A needs_input card that already hit the block-loop limit is
-    parked in ``scheduled`` instead of being re-promoted by the
-    auto-decomposer."""
-    with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="x", triage=True)
-        with kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET block_kind = 'needs_input', block_recurrences = ? WHERE id = ?",
-                (kb.BLOCK_RECURRENCE_LIMIT, tid),
-            )
-
-    outcome = decomp.decompose_task(tid, author="auto-decomposer")
-    assert outcome.ok is False
-    assert "parked in scheduled" in outcome.reason
-
-    with kbc.connect() as conn:
-        task = kb.get_task(conn, tid)
-    assert task.status == "scheduled"
-
-
 def test_decompose_allows_capability_block_loop(kanban_home):
     """Cards with block kinds other than ``needs_input`` keep flowing
     through the decomposer even past the recurrence limit."""
@@ -310,16 +289,15 @@ def test_decompose_allows_capability_block_loop(kanban_home):
     assert task.status != "scheduled"
 
 
-def test_schedule_task_accepts_triage(kanban_home):
-    """``schedule_task`` must accept a task in ``triage`` so the
-    block-loop gate can park it."""
+def test_schedule_task_refuses_triage(kanban_home):
+    """``schedule_task`` keeps rejecting triage cards: pick B has no
+    park-in-``scheduled`` state, so hourly-recheck cards stay in triage
+    visible with their open ask (option-A rule superseded)."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="x", triage=True)
         ok = kb.schedule_task(conn, tid, reason="test park")
-    assert ok is True
+    assert ok is False
 
     with kbc.connect() as conn:
         task = kb.get_task(conn, tid)
-    assert task.status == "scheduled"
-
-
+    assert task.status == "triage"

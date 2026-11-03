@@ -101,7 +101,7 @@ def decompose_triage_task(
     """
     from hermes_cli.kanban_db import (
         _canonical_assignee, _link, _append_event, _insert_comment,
-        write_txn, recompute_ready,
+        write_txn, recompute_ready, needs_input_recheck_remaining,
     )
 
     if not children:
@@ -126,6 +126,11 @@ def decompose_triage_task(
             "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'decomposed' LIMIT 1",
             (task_id,),
         ).fetchone():
+            return None
+        if needs_input_recheck_remaining(conn, task_id) > 0:
+            # Hourly recheck hold (ESC-024 pick B): the fan-out exit respects
+            # the same hold the single-task exit does — no promotion road
+            # around the machine-stamped one-hour window.
             return None
         child_ids = [
             _insert_decomposed_child(conn, task_id, root_row, child, author, now)

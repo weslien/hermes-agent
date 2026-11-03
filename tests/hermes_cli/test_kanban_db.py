@@ -2082,3 +2082,61 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+def test_needs_input_recheck_remaining_reads_machine_stamped_claim(kanban_home):
+    """ESC-024 pick B: the hourly hold reads only the newest
+    machine-stamped ``claimed`` event. Full window for a fresh claim,
+    released at/after the hour, absent for any other card shape."""
+    with kbc.connect() as conn:
+        held = kb.create_task(conn, title="waiting on a human", triage=True)
+        other = kb.create_task(conn, title="different ask", triage=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET block_kind = 'needs_input', "
+                "block_recurrences = ? WHERE id = ?",
+                (kb.BLOCK_RECURRENCE_LIMIT, held),
+            )
+            # Same loop shape but a capability ask, and a below-limit
+            # needs_input card: neither is the paced one-human-act wait.
+            conn.execute(
+                "UPDATE tasks SET block_kind = 'capability', "
+                "block_recurrences = ? WHERE id = ?",
+                (kb.BLOCK_RECURRENCE_LIMIT, other),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'claimed', NULL, ?)",
+                (held, int(time.time()) - 60),
+            )
+
+    with kbc.connect() as conn:
+        # Fresh claim: full-hour window still open.
+        assert 0 < kb.needs_input_recheck_remaining(conn, held) <= kb.NEEDS_INPUT_RECHECK_SECONDS
+        # No claim stamp at all: free — the hold self-heals because the
+        # next promote claims and stamps the anchor.
+        assert kb.needs_input_recheck_remaining(conn, other) == 0
+
+    with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET block_kind = 'needs_input', "
+                "block_recurrences = ? WHERE id = ?",
+                (kb.BLOCK_RECURRENCE_LIMIT - 1, held),
+            )
+        # Below the repeat-block limit: not the loop the pacing targets.
+        assert kb.needs_input_recheck_remaining(conn, held) == 0
+
+    with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET block_recurrences = ? WHERE id = ?",
+                (kb.BLOCK_RECURRENCE_LIMIT, held),
+            )
+            conn.execute(
+                "UPDATE task_events SET created_at = ? "
+                "WHERE task_id = ? AND kind = 'claimed'",
+                (int(time.time()) - kb.NEEDS_INPUT_RECHECK_SECONDS - 300, held),
+            )
+        # The machine-stamped hour elapsed: released.
+        assert kb.needs_input_recheck_remaining(conn, held) == 0

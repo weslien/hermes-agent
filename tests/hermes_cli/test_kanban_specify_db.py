@@ -3,6 +3,7 @@ from the triage column to todo. LLM-free by design."""
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -80,3 +81,50 @@ def test_specify_records_audit_comment_only_when_author_given(kanban_home):
     assert comments2 == []
 
 
+def _mark_needs_input_block_loop(conn, tid, claim_age_seconds=None):
+    """Stamp the block-loop fields plus the machine-stamped ``claimed``
+    event the hourly recheck anchors to."""
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET block_kind = 'needs_input', "
+            "block_recurrences = ? WHERE id = ?",
+            (kb.BLOCK_RECURRENCE_LIMIT, tid),
+        )
+        if claim_age_seconds is not None:
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'claimed', NULL, ?)",
+                (tid, int(time.time()) - claim_age_seconds),
+            )
+
+
+def test_specify_refuses_promotion_while_hourly_recheck_hold_open(kanban_home):
+    """The triage→todo transition refuses a needs_input block-loop card
+    whose last machine-stamped claim is under an hour old (ESC-024 pick B):
+    no actor promotes around the hold, so a faster re-claim is structurally
+    impossible."""
+    with kbc.connect() as conn:
+        tid = _create_triage(conn, title="waiting on a human")
+        _mark_needs_input_block_loop(conn, tid, claim_age_seconds=60)
+
+    with kbc.connect() as conn:
+        ok = kb.specify_triage_task(conn, tid, title="Refined", body="b", author="ace")
+    assert ok is False
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_specify_promotes_once_hourly_recheck_window_elapsed(kanban_home):
+    """The hold releases when the machine-stamped hour is over: the card
+    promotes in full (todo, then ready for a parent-free card)."""
+    with kbc.connect() as conn:
+        tid = _create_triage(conn, title="waiting on a human")
+        _mark_needs_input_block_loop(
+            conn, tid, claim_age_seconds=kb.NEEDS_INPUT_RECHECK_SECONDS + 300,
+        )
+
+    with kbc.connect() as conn:
+        ok = kb.specify_triage_task(conn, tid, title="Refined", body="b", author="ace")
+    assert ok is True
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "ready"

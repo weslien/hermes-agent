@@ -112,6 +112,11 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
 # Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
+# ESC-024 pick B (Gustav ruling 2026-11-03): while a needs_input block-loop
+# wait stays open, the board re-runs the card at most once per hour. The
+# window is anchored to the last machine-stamped dispatcher claim — see
+# needs_input_recheck_remaining.
+NEEDS_INPUT_RECHECK_SECONDS = 3600
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -3244,6 +3249,35 @@ def _route_block(
     return "blocked", "blocked", set_sql, (kind, recurrences), payload
 
 
+def needs_input_recheck_remaining(conn: sqlite3.Connection, task_id: str) -> int:
+    """Seconds until the hourly recheck releases a needs_input block-loop
+    card; 0 when the card can promote now.
+
+    ESC-024 pick B: a card waiting on one open human act
+    (``block_kind='needs_input'`` at or above ``BLOCK_RECURRENCE_LIMIT``)
+    re-claims at most once per hour while the wait stays open. The window
+    runs from the newest ``claimed`` event — machine-stamped in the claim
+    txn — so a sub-hour re-claim is refused to every promotion actor, not
+    just the auto-decomposer. 0 for any other card, an un-claimed card, and
+    a card whose last claim is an hour old or more.
+    """
+    row = conn.execute(
+        "SELECT block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or row["block_kind"] != "needs_input":
+        return 0
+    if int(row["block_recurrences"] or 0) < BLOCK_RECURRENCE_LIMIT:
+        return 0
+    claim = conn.execute(
+        "SELECT created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if claim is None:
+        return 0
+    return max(0, NEEDS_INPUT_RECHECK_SECONDS - (int(time.time()) - int(claim["created_at"])))
+
+
 def redact_review_value(value: Any) -> Any:
     """Redact secrets at the domain boundary for durable review handoffs."""
     if isinstance(value, str):
@@ -3744,6 +3778,12 @@ def specify_triage_task(
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
+        if needs_input_recheck_remaining(conn, task_id) > 0:
+            # Hourly recheck hold (ESC-024 pick B): the triage exit stays
+            # closed while the hour since the last machine-stamped claim runs
+            # short. Nobody can promote around this — decomposer, specifier
+            # CLI, dashboard — so a re-claim faster than hourly is impossible.
+            return False
         existing = conn.execute(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
@@ -3880,7 +3920,7 @@ def schedule_task(
                    claim_expires= NULL,
                    worker_pid   = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked', 'triage')
+               AND status IN ('todo', 'ready', 'running', 'blocked')
         """
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
