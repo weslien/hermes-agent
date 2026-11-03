@@ -313,16 +313,17 @@ def decompose_task(
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
 
-    # Park needs_input cards past the block-loop limit; do not re-promote.
-    if task.block_kind == "needs_input" and task.block_recurrences >= kb.BLOCK_RECURRENCE_LIMIT:
-        with kbc.connect_closing() as conn:
-            ok = kb.schedule_task(
-                conn, task.id,
-                reason="needs_input block-loop detected; parked until orchestrator unblocks",
-            )
-        if ok:
-            return DecomposeOutcome(task.id, False, "parked in scheduled due to needs_input block loop")
-        return DecomposeOutcome(task.id, False, "block-loop gate: schedule_task failed")
+    # ESC-024 pick B — hourly recheck: while the hour since the last
+    # machine-stamped claim runs short the kernel refuses both triage exits
+    # anyway; skip the aux LLM and let the card wait in triage, so it
+    # re-claims at most once per hour while the needs_input wait stays open.
+    with kbc.connect_closing() as conn:
+        recheck_remaining = kb.needs_input_recheck_remaining(conn, task.id)
+    if recheck_remaining > 0:
+        return DecomposeOutcome(
+            task.id, False,
+            f"hourly needs_input recheck: {recheck_remaining}s left in hold",
+        )
 
     routing = _load_routing(root_assignee=task.assignee)
     raw, reason = _call_aux(

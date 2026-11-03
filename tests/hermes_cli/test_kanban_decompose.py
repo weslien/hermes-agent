@@ -8,6 +8,7 @@ and the assignee-fallback logic.
 from __future__ import annotations
 
 import json as jsonlib
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -49,6 +50,28 @@ def _patch_aux_client(content: str, *, model: str = "test-model"):
         "agent.auxiliary_client.call_llm",
         return_value=_fake_aux_response(content),
     )
+
+
+def _mark_block_loop(tid, kind="needs_input", recurrences=None):
+    """Stamp a card with the block-loop fields the hourly recheck reads."""
+    with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET block_kind = ?, block_recurrences = ? WHERE id = ?",
+                (kind, recurrences if recurrences is not None else kb.BLOCK_RECURRENCE_LIMIT, tid),
+            )
+
+
+def _stamp_last_claim(tid, age_seconds):
+    """Write the machine-stamped ``claimed`` event the hold anchors to,
+    ``age_seconds`` ago."""
+    with kbc.connect() as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'claimed', NULL, ?)",
+                (tid, int(time.time()) - age_seconds),
+            )
 
 
 def _patch_extra_body():
@@ -254,6 +277,65 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
         for p in patches:
             p.stop()
     assert outcome.ok is False
+
+
+def test_decompose_holds_needs_input_block_loop_subhour(kanban_home):
+    """A needs_input block-loop card waits in triage while the hour since
+    its last machine-stamped dispatcher claim runs short; the aux LLM is
+    never called (ESC-024 pick B: at most one re-claim per hour)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="x", triage=True)
+    _mark_block_loop(tid)
+    _stamp_last_claim(tid, 60)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "promote",
+        "title": "Released",
+        "body": "y",
+    })
+    with patch(
+        "agent.auxiliary_client.call_llm",
+        return_value=_fake_aux_response(llm_payload),
+    ) as aux:
+        outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    aux.assert_not_called()
+    assert outcome.ok is False
+    assert "hourly needs_input recheck" in outcome.reason
+
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status == "triage"
+
+
+def test_decompose_promotes_needs_input_block_loop_after_hour(kanban_home):
+    """Once an hour or more passed since the last claim the card promotes
+    again: the board re-runs the card once per hour, not never."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="x", triage=True)
+    _mark_block_loop(tid)
+    _stamp_last_claim(tid, kb.NEEDS_INPUT_RECHECK_SECONDS + 300)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "promote",
+        "title": "Released",
+        "body": "y",
+    })
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+    assert outcome.ok is True
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.status in ("todo", "ready")
+    assert task.status != "scheduled"
 
 
 def test_decompose_allows_capability_block_loop(kanban_home):

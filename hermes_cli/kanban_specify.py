@@ -200,6 +200,17 @@ def specify_task(
     if task is None:
         return SpecifyOutcome(task_id, False, reason)
 
+    # ESC-024 pick B — hourly recheck: mirror the decomposer; hold the card
+    # in triage and skip the aux LLM while the machine-stamped hour since
+    # the last claim runs short.
+    with kbc.connect_closing() as conn:
+        recheck_remaining = kb.needs_input_recheck_remaining(conn, task_id)
+    if recheck_remaining > 0:
+        return SpecifyOutcome(
+            task_id, False,
+            f"hourly needs_input recheck: {recheck_remaining}s left in hold",
+        )
+
     raw, reason = _call_aux(
         "specify", task_id, aux_task="triage_specifier", system=_SYSTEM_PROMPT,
         user=_USER_TEMPLATE.format(**_task_prompt_fields(task)),

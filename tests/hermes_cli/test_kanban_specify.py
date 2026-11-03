@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json as jsonlib
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -139,3 +140,33 @@ def test_cli_specify_tenant_filter(kanban_home, capsys):
         assert kb.get_task(conn, inside).status in {"todo", "ready"}
 
 
+def test_specify_task_holds_needs_input_block_loop_in_triage(kanban_home):
+    """A needs_input block-loop card answers the hourly recheck before the
+    aux LLM runs (ESC-024 pick B): within the machine-stamped hour since
+    its last claim it stays in triage and the LLM is never called."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="waiting on a human", triage=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET block_kind = 'needs_input', "
+                "block_recurrences = ? WHERE id = ?",
+                (kb.BLOCK_RECURRENCE_LIMIT, tid),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+                "VALUES (?, NULL, 'claimed', NULL, ?)",
+                (tid, int(time.time()) - 60),
+            )
+
+    patcher, _mock = _patch_aux_client(jsonlib.dumps({
+        "title": "Refined",
+        "body": "b",
+    }))
+    with patcher as aux:
+        outcome = spec.specify_task(tid, author="me")
+    aux.assert_not_called()
+    assert outcome.ok is False
+    assert "hourly needs_input recheck" in outcome.reason
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
