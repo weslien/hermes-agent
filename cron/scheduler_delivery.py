@@ -463,8 +463,7 @@ def _delivery_secret_scope():
     if current_secret_scope() is not None:
         yield
         return
-    from cron.scheduler import _fire_secret_scope
-    with _fire_secret_scope():
+    with _sched._fire_secret_scope():
         yield
 
 
