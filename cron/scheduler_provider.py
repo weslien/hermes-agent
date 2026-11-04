@@ -117,19 +117,37 @@ def routed_profile_fire(home=None) -> bool:
 
 @contextlib.contextmanager
 def _profile_cron_scope(home):
-    """Scope the calling thread to one profile's home + cron store for the block."""
+    """Scope the calling thread to one profile's home + cron store + secret scope + terminal scope for the block.
+
+    Matches the contract documented in cron/AGENTS.md and the run_one_job_body pattern."""
     from cron.jobs import use_cron_store
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from agent.secret_scope import (
+        current_secret_scope, reset_secret_scope, reset_multiplex_context,
+        set_multiplex_context, set_secret_scope,
+    )
+    from tui_gateway.launch_profile_policy import owner_secret_scope
+    from hermes_cli.env_loader import hydrate_profile_secret_sources
+    from tools.terminal_scope import install_and_reset_profile_terminal_scope
+    from pathlib import Path
 
-    # Record per-profile heartbeat after each tick cycle. Distinguish a COMPLETED cycle (``_tick_error``
-    # unset) — where each profile's beat reflects its own outcome, so a yielding profile does not darken
-    # healthy siblings — from an aborted one (exception), where no profile completed and all beats are
-    # unsuccessful (#32612).
     home_token = set_hermes_home_override(str(home))
+    secret_token = None
+    multiplex_token = None
+    if current_secret_scope() is None:
+        hydrate_profile_secret_sources(home)
+        secret_token = set_secret_scope(owner_secret_scope(Path(home)), profile_home=str(home))
+        if routed_profile_fire(home):
+            multiplex_token = set_multiplex_context(True)
     try:
         with use_cron_store(home):
-            yield
+            with install_and_reset_profile_terminal_scope(home):
+                yield
     finally:
+        if multiplex_token is not None:
+            reset_multiplex_context(multiplex_token)
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
 
 
