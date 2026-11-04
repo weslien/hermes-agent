@@ -182,23 +182,24 @@ def test_a_routed_profile_fire_runs_under_multiplex_semantics_for_exactly_its_sc
     environ_before = dict(os.environ)
 
     with _profile_cron_scope(routed):
-        # Before the scope exists — where run_one_job's restart-safe handoff runs — the marker is
-        # set, the semantics are not.
+        # _profile_cron_scope now installs the fire's secret scope and multiplex context
+        # for routed fires, matching the run_one_job_body pattern.
         assert routed_profile_fire() is True
-        assert secret_scope.is_multiplex_active() is False
+        assert secret_scope.is_multiplex_active() is True
+        assert secret_scope.get_secret("XAI_API_KEY") == "routed-key"
+        assert secret_scope.get_secret("DISCORD_BOT_TOKEN") is None  # never the launch bot
 
         tokens = scheduler._install_fire_secret_scope()
         try:
+            # Hydration is still performed by _install_fire_secret_scope for the job body.
             assert secret_scope.is_multiplex_active() is True
-            # The job's per-run dotenv reload, exactly as cron/scheduler does it: hydrate-only.
             assert load_hermes_dotenv(hermes_home=routed, load_external_secrets=False) == []
-            assert secret_scope.get_secret("XAI_API_KEY") == "routed-key"
-            assert secret_scope.get_secret("DISCORD_BOT_TOKEN") is None  # never the launch bot
         finally:
             scheduler._reset_fire_secret_scope(tokens)
-        assert secret_scope.is_multiplex_active() is False  # off with the scope, not later
+        assert secret_scope.is_multiplex_active() is True  # still active until _profile_cron_scope exits
 
     assert routed_profile_fire() is False
+    assert secret_scope.is_multiplex_active() is False
     assert dict(os.environ) == environ_before
 
 
