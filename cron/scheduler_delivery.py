@@ -448,6 +448,26 @@ def _home_env_lookup(env_var: str, suffix: str = "", *, strip: bool = False) -> 
     return value
 
 
+@contextlib.contextmanager
+def _delivery_secret_scope():
+    """Secret scope for resolving a delivery home target: the CURRENT fire home's, installed
+    when no turn/adapter/fire scope is active. ``run_one_job`` scopes its delivery span, but the
+    receipt-reconcile lane (``scheduler_authority`` -> ``_save_compose_deliver``) resolves targets
+    with no scope installed, so under multiplexing ``get_secret`` fails closed there once per
+    tick (UnscopedSecretError, Workstream A). Reuses the fire scope so the profile's secret
+    sources hydrate first; a scope set by an enclosing turn/adapter is never replaced.
+    shortcut: the scope is always the context home's (the fire-home contract every entry point
+    keeps); make it an explicit argument only if a lane resolves another home's targets.
+    """
+    from agent.secret_scope import current_secret_scope
+    if current_secret_scope() is not None:
+        yield
+        return
+    from cron.scheduler import _fire_secret_scope
+    with _fire_secret_scope():
+        yield
+
+
 def _env_home_target_chat_id(platform_name: str) -> str:
     """Home chat id from the env mirror only (no config).
 
@@ -464,12 +484,14 @@ def _env_home_target_chat_id(platform_name: str) -> str:
 
 def _get_home_target_chat_id(platform_name: str) -> str:
     """Home target chat id: env var (first, so operator overrides win) → legacy env var →
-    config.yaml ``home_channel``."""
-    value = _env_home_target_chat_id(platform_name)
-    if value:
-        return value
-    home = _get_config_home_channel(platform_name)
-    return str(home.chat_id) if home is not None and home.chat_id else ""
+    config.yaml ``home_channel``. Scoped so the receipt-reconcile lane resolves it under
+    multiplexing too."""
+    with _delivery_secret_scope():
+        value = _env_home_target_chat_id(platform_name)
+        if value:
+            return value
+        home = _get_config_home_channel(platform_name)
+        return str(home.chat_id) if home is not None and home.chat_id else ""
 
 
 def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
@@ -482,21 +504,22 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
     ``reply_to_message_id`` (#24409). Pointing cron at a dedicated topic via this env var lets replies work
     as expected without changing the lobby invariant.
     """
-    if platform_name.lower() == "telegram":
-        cron_thread = _home_env_lookup("TELEGRAM_CRON_THREAD_ID", strip=True)
-        if cron_thread:
-            return cron_thread
-    env_var = _resolve_home_env_var(platform_name)
-    value = _home_env_lookup(env_var, "_THREAD_ID", strip=True) if env_var else ""
-    if value:
-        return value
-    # config.yaml fallback only when the chat id also came from config (an env-provided chat id
-    # keeps its env-provided thread semantics).
-    if not _env_home_target_chat_id(platform_name):
-        home = _get_config_home_channel(platform_name)
-        if home is not None and home.thread_id:
-            return str(home.thread_id)
-    return None
+    with _delivery_secret_scope():
+        if platform_name.lower() == "telegram":
+            cron_thread = _home_env_lookup("TELEGRAM_CRON_THREAD_ID", strip=True)
+            if cron_thread:
+                return cron_thread
+        env_var = _resolve_home_env_var(platform_name)
+        value = _home_env_lookup(env_var, "_THREAD_ID", strip=True) if env_var else ""
+        if value:
+            return value
+        # config.yaml fallback only when the chat id also came from config (an env-provided chat id
+        # keeps its env-provided thread semantics).
+        if not _env_home_target_chat_id(platform_name):
+            home = _get_config_home_channel(platform_name)
+            if home is not None and home.thread_id:
+                return str(home.thread_id)
+        return None
 
 
 def _iter_home_target_platforms():
