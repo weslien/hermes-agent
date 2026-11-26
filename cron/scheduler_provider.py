@@ -129,17 +129,18 @@ def _profile_cron_scope(home):
     from tui_gateway.launch_profile_policy import owner_secret_scope
     from hermes_cli.env_loader import hydrate_profile_secret_sources
     from tools.terminal_scope import install_and_reset_profile_terminal_scope
-    from pathlib import Path
 
-    home_token = set_hermes_home_override(str(home))
-    secret_token = None
-    multiplex_token = None
-    if current_secret_scope() is None:
-        hydrate_profile_secret_sources(home)
-        secret_token = set_secret_scope(owner_secret_scope(Path(home)), profile_home=str(home))
-        if routed_profile_fire(home):
-            multiplex_token = set_multiplex_context(True)
+    # Hydrate can refuse before anything lands (ConfigBackendUnavailable, a deliberate
+    # SystemExit subclass that is never cached): start every token at None and None-guard
+    # each reset so a refusal unwinds exactly what it owns — worker-boot pattern (cron/scheduler.py).
+    home_token = secret_token = multiplex_token = None
     try:
+        home_token = set_hermes_home_override(str(home))
+        if current_secret_scope() is None:
+            hydrate_profile_secret_sources(home)
+            secret_token = set_secret_scope(owner_secret_scope(Path(home)), profile_home=str(home))
+            if routed_profile_fire(home):
+                multiplex_token = set_multiplex_context(True)
         with use_cron_store(home):
             with install_and_reset_profile_terminal_scope(home):
                 yield
@@ -148,7 +149,32 @@ def _profile_cron_scope(home):
             reset_multiplex_context(multiplex_token)
         if secret_token is not None:
             reset_secret_scope(secret_token)
-        reset_hermes_home_override(home_token)
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+
+
+def _record_cycle_outcome(home, tick_error, profile_errors):
+    """Cycle-end status writes for one profile, contained per profile like the dispatch
+    loop: the scope enter can refuse (``ConfigBackendUnavailable``, a ``SystemExit``
+    subclass), and one profile's refusal must not end the whole ticker thread."""
+    from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
+
+    try:
+        with _profile_cron_scope(home):
+            _home_ok = tick_error is None and str(home) not in profile_errors
+            _guarded_store_write(record_ticker_heartbeat, "heartbeat", success=_home_ok)
+            if _home_ok:
+                _guarded_store_write(clear_ticker_error, "error clear")
+            elif str(home) in profile_errors:
+                _guarded_store_write(
+                    record_ticker_error, "tick error", profile_errors[str(home)]
+                )
+            elif tick_error:
+                _guarded_store_write(record_ticker_error, "tick error", tick_error)
+    except BaseException as e:
+        logger.error(
+            "Cron heartbeat scope error for profile at %s: %s", home, e, exc_info=True
+        )
 
 
 class CronScheduler(ABC):
@@ -673,23 +699,7 @@ class InProcessCronScheduler(CronScheduler):
                 consecutive_failures = _note_tick_failure(e, consecutive_failures)
             # Completed cycle: each profile's own outcome; aborted cycle: all beats unsuccessful.
             for _, home in cycle_homes:
-                with _profile_cron_scope(home):
-                    _home_ok = _tick_error is None and str(home) not in _profile_errors
-                    _guarded_store_write(
-                        record_ticker_heartbeat, "heartbeat", success=_home_ok
-                    )
-                    if _home_ok:
-                        _guarded_store_write(clear_ticker_error, "error clear")
-                    elif str(home) in _profile_errors:
-                        _guarded_store_write(
-                            record_ticker_error,
-                            "tick error",
-                            _profile_errors[str(home)],
-                        )
-                    elif _tick_error:
-                        _guarded_store_write(
-                            record_ticker_error, "tick error", _tick_error
-                        )
+                _record_cycle_outcome(home, _tick_error, _profile_errors)
             if ok:
                 consecutive_failures = 0
             wait_for = _backoff_wait_seconds(interval, consecutive_failures)

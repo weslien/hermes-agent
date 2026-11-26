@@ -303,3 +303,100 @@ def test_dashboard_run_now_isolates_a_sibling_profile_fire_like_the_ticker(tmp_p
     assert web_server_cron._fire_cron_job_for_profile("default", launch_job) is True
     assert (probe / "launch").read_text().strip() == "<unset>|launch-secret"
     assert "ROUTED_ONLY_SECRET" not in os.environ
+
+
+def test_profile_cron_scope_enter_refusal_resets_what_it_installed(tmp_path, monkeypatch):
+    """If hydration refuses before anything lands (ConfigBackendUnavailable is a
+    SystemExit subclass, never cached), the enter must reset the home override it
+    installed and let the refusal propagate. No token may survive on the thread."""
+    from cron.scheduler_provider import _profile_cron_scope
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+    from hermes_constants import get_hermes_home
+    from agent import secret_scope
+
+    launch = tmp_path / "launch"
+    routed = tmp_path / "profiles" / "ops"
+    for home in (launch, routed):
+        (home / "cron").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+
+    def _refuse(home):
+        raise ConfigBackendUnavailable("backend down in test")
+
+    monkeypatch.setattr("hermes_cli.env_loader.hydrate_profile_secret_sources", _refuse)
+
+    # A fresh thread starts with clean ContextVars, so this test does not depend on
+    # scopes other tests in this file leaked into the main thread.
+    result = {}
+
+    def _enter():
+        try:
+            with _profile_cron_scope(routed):
+                result["reached_body"] = True
+        except BaseException as e:
+            result["exc"] = type(e).__name__
+            result["home_after"] = str(get_hermes_home())
+            result["scope_clean"] = secret_scope.current_secret_scope() is None
+            result["multiplex_off"] = not secret_scope.is_multiplex_active()
+
+    thread = threading.Thread(target=_enter)
+    thread.start()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    assert result == {
+        "exc": "ConfigBackendUnavailable",
+        "home_after": str(launch.resolve()),
+        "scope_clean": True,
+        "multiplex_off": True,
+    }
+
+
+def test_ticker_survives_a_profile_whose_hydration_refuses(tmp_path, monkeypatch):
+    """One profile's hydration refuses every cycle (the refusal is never cached). The
+    ticker thread must contain it per profile and keep ticking the healthy sibling:
+    killing the thread is a silent host-wide cron stop."""
+    from cron.scheduler_provider import InProcessCronScheduler
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+    from hermes_cli import env_loader
+    from hermes_constants import get_hermes_home
+    from pathlib import Path
+
+    bad_home = tmp_path / "bad"
+    good_home = tmp_path / "good"
+    for home in (bad_home, good_home):
+        (home / "cron").mkdir(parents=True)
+    real_hydrate = env_loader.hydrate_profile_secret_sources
+
+    def _refuse_bad(home):
+        if Path(home) == bad_home:
+            raise ConfigBackendUnavailable("backend down in test")
+        return real_hydrate(home)
+
+    monkeypatch.setattr(env_loader, "hydrate_profile_secret_sources", _refuse_bad)
+
+    stop = threading.Event()
+    ticks: list[str] = []
+
+    def _tick(*args, **kwargs):
+        ticks.append(str(get_hermes_home()))
+        if len(ticks) >= 3:
+            stop.set()
+        return 0
+
+    provider = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=_tick):
+        thread = threading.Thread(
+            target=provider.start,
+            args=(stop,),
+            kwargs={"interval": 0, "profile_homes": [("bad", bad_home), ("good", good_home)]},
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=10)
+        stop.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert len(ticks) >= 3, f"ticker died early: only {len(ticks)} tick(s)"
+    assert str(good_home) in ticks

@@ -456,7 +456,7 @@ def _delivery_secret_scope():
     with no scope installed, so under multiplexing ``get_secret`` fails closed there once per
     tick (UnscopedSecretError, Workstream A). Reuses the fire scope so the profile's secret
     sources hydrate first; a scope set by an enclosing turn/adapter is never replaced.
-    shortcut: the scope is always the context home's (the fire-home contract every entry point
+    Shortcut: the scope is always the context home's (the fire-home contract every entry point
     keeps); make it an explicit argument only if a lane resolves another home's targets.
     """
     from agent.secret_scope import current_secret_scope
