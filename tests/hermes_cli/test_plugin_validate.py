@@ -687,3 +687,55 @@ def test_oauth_in_a_plugin_keyed_custom_fails_admission(tmp_path):
     report = validate_plugin_dir(plugin)
 
     assert [ok for name, ok, _ in report.checks if name == "oauth"] == [False]
+
+
+class TestPluginEnabledDisabledExclusivity:
+    """plugins.enabled and plugins.disabled must not name the same plugin.
+
+    A plugin listed in both loads nowhere because disabled wins.
+    ``hermes plugins validate`` must fail loud rather than silently skip.
+    """
+
+    @staticmethod
+    def _home_with_plugin(tmp_path: Path, enabled, disabled, name="mnemosyne"):
+        home = tmp_path / "home"
+        home.mkdir()
+        plugin_dir = home / "plugins" / name
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text(
+            f"name: {name}\nversion: '1.0'\ndescription: test plugin\n",
+            encoding="utf-8",
+        )
+        (plugin_dir / "__init__.py").write_text(
+            "def register(ctx):\n    pass\n", encoding="utf-8"
+        )
+        (home / "config.yaml").write_text(
+            f"plugins:\n  enabled: {enabled!r}\n  disabled: {disabled!r}\n",
+            encoding="utf-8",
+        )
+        return home, plugin_dir
+
+    def test_dual_listing_fails_with_non_zero_exit(self, tmp_path, monkeypatch):
+        """A plugin in both plugins.enabled and plugins.disabled fails validation."""
+        home, plugin_dir = self._home_with_plugin(tmp_path, ["mnemosyne"], ["mnemosyne"])
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        report = validate_plugin_dir(plugin_dir)
+        assert report.exit_code != 0
+        assert any(
+            "mnemosyne" in f and "plugins.enabled" in f and "plugins.disabled" in f
+            for f in report.failures
+        )
+
+    def test_only_enabled_passes(self, tmp_path, monkeypatch):
+        """A plugin listed only in plugins.enabled passes validation."""
+        home, plugin_dir = self._home_with_plugin(tmp_path, ["mnemosyne"], [])
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        report = validate_plugin_dir(plugin_dir)
+        assert report.exit_code == 0
+
+    def test_only_disabled_passes(self, tmp_path, monkeypatch):
+        """A plugin listed only in plugins.disabled passes validation."""
+        home, plugin_dir = self._home_with_plugin(tmp_path, [], ["mnemosyne"])
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        report = validate_plugin_dir(plugin_dir)
+        assert report.exit_code == 0
