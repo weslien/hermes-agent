@@ -66,7 +66,7 @@ export interface CatalogEntry {
   installed: boolean;
   installed_sha: string | null;
   update_available: boolean;
-  runtime_status: "disabled" | "enabled" | "inactive" | null;
+  runtime_status: "disabled" | "enabled" | "inactive" | "in both lists" | null;
 }
 
 export interface CatalogRemovedEntry {

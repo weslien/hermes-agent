@@ -878,8 +878,13 @@ def _plugin_auth_hint(name: str, provides_tools: list) -> tuple:
 
 
 def _plugin_runtime_status(aliases: set, enabled_set: set, disabled_set: set) -> str:
-    """enabled / disabled / inactive for a plugin's name+key alias set (disabled wins)."""
-    return "disabled" if aliases & disabled_set else "enabled" if aliases & enabled_set else "inactive"
+    """enabled / disabled / inactive for a plugin's name+key alias set; a name in both lists is
+    the validation conflict (nothing wins), mirroring ``plugins_cmd._plugin_status``."""
+    if aliases & disabled_set:
+        if aliases & enabled_set:
+            return "in both lists"
+        return "disabled"
+    return "enabled" if aliases & enabled_set else "inactive"
 
 
 def _merged_plugins_hub(force_refresh: bool = False) -> dict[str, Any]:

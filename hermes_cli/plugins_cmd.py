@@ -934,12 +934,15 @@ def _category_active_names() -> set:
 
 def _plugin_status(name: str, enabled: set, disabled: set, key: str = "", *, source: str = "",
                    dir_path=None, active: frozenset | set = frozenset()) -> str:
-    """User-facing activation state for a plugin name or key. Mirrors ``gate_manifest``: an explicit
-    disable wins, then the allow-list, then the activations that need no list entry — bundled
-    backends/platforms and model providers from any source (*source* + *dir_path*) and category-selected providers
+    """User-facing activation state for a plugin name or key. Mirrors ``gate_manifest``: a name in
+    both lists is a validation conflict (nothing wins), then an explicit disable, then the allow-list,
+    then the activations that need no list entry — bundled backends/platforms and model providers
+    from any source (*source* + *dir_path*) and category-selected providers
     (*active*, see :func:`_category_active_names`)."""
     names = {name, key}
     if names & disabled:
+        if names & enabled:
+            return "in both lists"
         return "disabled"
     if names & enabled or names & active:
         return "enabled"

@@ -1064,7 +1064,7 @@ function PluginRowCard(props: PluginRowCardProps) {
   const badgeTone =
     row.runtime_status === "enabled"
       ? "success"
-      : row.runtime_status === "disabled"
+      : row.runtime_status === "disabled" || row.runtime_status === "in both lists"
         ? "destructive"
         : "outline";
 

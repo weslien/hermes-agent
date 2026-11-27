@@ -103,3 +103,43 @@ def _validate_quoted_containers(config: dict[str, Any], issues: list[ConfigIssue
                    "and every reader ignores the string",
                    f"Run: hermes config set {key} {shlex.quote(value)}  (stores a real {kind}), "
                    "or remove the quotes in config.yaml")
+
+
+# Sections whose enabled/disabled list pair is exclusive membership — skills/toolsets join this
+# mapping when they gain the same pair keys.
+EXCLUSIVE_MEMBERSHIP_SECTIONS = {"plugins": "Plugin"}
+
+
+def exclusive_membership_conflicts(section: Any) -> list[str]:
+    """Names listed in both ``enabled`` and ``disabled`` of one section, sorted. Literal
+    spellings only — alias-level overlaps stay the loader's judgment
+    (``plugins_discovery.plugins_in_both_lists``)."""
+    if not isinstance(section, dict):
+        return []
+    enabled, disabled = section.get("enabled"), section.get("disabled")
+    if not (isinstance(enabled, list) and isinstance(disabled, list)):
+        return []
+    return sorted({v for v in enabled if isinstance(v, str)} & {v for v in disabled if isinstance(v, str)})
+
+
+def exclusive_membership_error(name: str, section_key: str = "plugins", label: str = "Plugin") -> str:
+    """The actionable message every surface prints for one dual-listed name."""
+    return (f"{label} '{name}' is listed in both {section_key}.enabled and {section_key}.disabled; "
+            "remove it from one list")
+
+
+def exclusive_membership_findings(data: dict[str, Any]) -> list[str]:
+    """All canonical dual-listing findings for every exclusive pair section in *data*."""
+    return [exclusive_membership_error(name, section_key, label)
+            for section_key, label in EXCLUSIVE_MEMBERSHIP_SECTIONS.items()
+            for name in exclusive_membership_conflicts(data.get(section_key))]
+
+
+def _validate_exclusive_membership(config: dict[str, Any], issues: list[ConfigIssue]) -> None:
+    """The enabled/disabled pair is exclusive: a name in both fails validation instead of the
+    loader silently preferring one side (#131980 follow-up). Finding only — the file is never
+    rewritten."""
+    for section_key, label in EXCLUSIVE_MEMBERSHIP_SECTIONS.items():
+        for name in exclusive_membership_conflicts(config.get(section_key)):
+            _issue(issues, "error", exclusive_membership_error(name, section_key, label),
+                   f"Keep '{name}' in only one of the two lists in config.yaml")

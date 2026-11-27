@@ -550,12 +550,30 @@ def _check_builtin_collisions(
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 
+def _check_config_exclusive_lists(report: ValidationReport) -> None:
+    """``plugins validate`` also judges the user's config: a plugin in both ``plugins.enabled``
+    and ``plugins.disabled`` fails validation (membership is exclusive, nothing wins — #131980
+    follow-up). The merged-config read itself refuses that file, so the refusal becomes the row;
+    with reads ignored (--ignore-user-config) the merged scan still fails the state, and
+    managed-overlay conflicts reach the same row."""
+    from hermes_cli.config import InvalidUserConfigError, load_config_readonly
+    from hermes_cli.config_value_checks import exclusive_membership_conflicts, exclusive_membership_error
+    try:
+        plugins = (load_config_readonly() or {}).get("plugins")
+    except InvalidUserConfigError as exc:
+        report.add("config: exclusive plugins.enabled/plugins.disabled", False, str(exc))
+        return
+    for name in exclusive_membership_conflicts(plugins):
+        report.add("config: exclusive plugins.enabled/plugins.disabled", False, exclusive_membership_error(name))
+
+
 def validate_plugin_dir(
     plugin_dir: Path, probe: Optional[tuple[list[str], dict[str, str]]] = None,
 ) -> ValidationReport:
     """Run every admission check against *plugin_dir* and return the report. *probe* is
     ``(python argv prefix, env)`` for the capability probe (see ``_run_capability_probe``)."""
     report = ValidationReport()
+    _check_config_exclusive_lists(report)
     plugin_dir = Path(plugin_dir)
 
     if not plugin_dir.is_dir():

@@ -178,6 +178,10 @@ def run_doctor(args):
     should_fix = getattr(args, 'fix', False)
     # Doctor runs from the interactive CLI, so CLI-gated tool checks (e.g. cronjob) see the same context.
     os.environ.setdefault("HERMES_INTERACTIVE", "1")
+    # Doctor must be able to diagnose a contradictory config file: the load-path refusal
+    # (#131980 dual-listed plugin) would kill its config-reading checks before they report.
+    # Reads stay alive like --ignore-user-config; the dual-list check below fails the run.
+    os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
     if getattr(args, 'ack', None):
         return _ack_advisory(args.ack)
     print()

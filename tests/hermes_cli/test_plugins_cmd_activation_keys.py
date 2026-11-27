@@ -174,10 +174,11 @@ def test_cli_enable_on_a_fresh_config_writes_no_toolset_list(home):
     _restart_backend()
 
 
-def test_plugin_in_both_lists_warns_instead_of_silent_debug_skip(home):
-    """A plugin listed in both plugins.enabled and plugins.disabled loads nowhere silently (#131980):
-    the disable still wins, but the gate must surface the contradiction at WARNING with both config
-    keys named, instead of the DEBUG skip that is invisible during normal operation."""
+def test_plugin_in_both_lists_fails_validation_at_error_level(home):
+    """A plugin listed in both plugins.enabled and plugins.disabled is a config validation
+    failure (#131980 follow-up): membership in the two lists is exclusive, nothing wins. The gate
+    refuses it at ERROR with both config keys named and the fix in the message; the config load
+    gate (``require_parseable_user_config``) rejects the file before a non-interactive run."""
     import logging
 
     _write_plugin(home / "plugins", "obs/intake", "intake-probe")
@@ -185,17 +186,20 @@ def test_plugin_in_both_lists_warns_instead_of_silent_debug_skip(home):
 
     conflicting = gate_manifest(manifest, {"obs/intake"}, {"obs/intake"})
     assert conflicting.action == "placeholder"
-    assert conflicting.error == "listed in both plugins.enabled and plugins.disabled — disabled wins"
-    assert conflicting.log[0] == logging.WARNING
+    assert conflicting.error == "listed in both plugins.enabled and plugins.disabled"
+    assert conflicting.log is not None
+    assert conflicting.log[0] == logging.ERROR  # WARNING was the silent preference this fix removes
     assert "plugins.enabled" in conflicting.log[1] and "plugins.disabled" in conflicting.log[1]
+    assert "remove it from one list" in conflicting.log[1]
 
     # Cross-form contradiction (path key in one list, manifest name in the other) is caught too —
-    # the gate matches either identifier, so the warning must not depend on identical spelling.
+    # the gate matches either identifier, so the refusal must not depend on identical spelling.
     cross = gate_manifest(manifest, {"obs/intake"}, {"intake-probe"})
-    assert cross.log[0] == logging.WARNING
+    assert cross.log is not None and cross.log[0] == logging.ERROR
 
     # A plain disable with no overlap stays a quiet DEBUG skip — no behavior change.
     plain = gate_manifest(manifest, {"obs/intake"}, {"other/plugin"})
+    assert plain.log is not None
     assert plain.error == "disabled via config" and plain.log[0] == logging.DEBUG
 
 
