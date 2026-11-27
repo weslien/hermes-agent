@@ -2018,3 +2018,21 @@ class TestCompatibleProvidersMalformedLegacyKey:
 
         assert names == ["legacy"]
         assert not [r for r in caplog.records if "custom_providers is a" in r.getMessage()]
+
+
+class TestPluginListOverlap:
+    """A plugin cannot appear in both plugins.enabled and plugins.disabled."""
+
+    def test_load_config_raises_on_dual_listing(self, tmp_path, monkeypatch):
+        """The config load path raises rather than warning when a plugin is dual-listed."""
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "plugins:\n  enabled: [mnemosyne]\n  disabled: [mnemosyne]\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        from hermes_cli.config import _LOAD_CONFIG_CACHE, InvalidUserConfigError, load_config
+        _LOAD_CONFIG_CACHE.clear()
+        with pytest.raises(InvalidUserConfigError, match="mnemosyne"):
+            load_config()
