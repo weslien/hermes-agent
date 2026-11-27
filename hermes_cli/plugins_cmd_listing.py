@@ -34,7 +34,11 @@ def _entry_status(entry: tuple, enabled: set, disabled: set, active: set) -> str
     return _pc()._plugin_status(name, enabled, disabled, key, source=source, dir_path=dir_path, active=active)
 
 
-_STATUS_MARKUP = {"disabled": "[red]disabled[/red]", "enabled": "[green]enabled[/green]"}
+_STATUS_MARKUP = {
+    "disabled": "[red]disabled[/red]",
+    "enabled": "[green]enabled[/green]",
+    "in both lists": "[bold red]in both lists[/bold red]",
+}
 
 
 def cmd_list(args: Any | None = None) -> None:

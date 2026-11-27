@@ -110,10 +110,13 @@ def _classify_entrypoint_value_kind(value: str) -> str:
 
 
 def _get_disabled_plugins() -> set:
-    """Read ``plugins.disabled`` — a deny-list that wins over ``plugins.enabled``."""
+    """Read ``plugins.disabled`` — a deny-list that wins over ``plugins.enabled``. Read straight
+    from the user's file so the lists stay visible when the merged load refuses the contradictory
+    dual-listed state; only the user file contributes these lists (defaults and managed scope
+    deliberately do not)."""
     try:
-        from hermes_cli.config import load_config
-        disabled = cfg_get(load_config(), "plugins", "disabled", default=[])
+        from hermes_cli.config import read_raw_config_readonly
+        disabled = cfg_get(read_raw_config_readonly() or {}, "plugins", "disabled", default=[])
         return set(disabled) if isinstance(disabled, list) else set()
     except Exception:
         return set()
@@ -122,10 +125,10 @@ def _get_disabled_plugins() -> set:
 def _get_enabled_plugins() -> Optional[set]:
     """Read the ``plugins.enabled`` allow-list (plugins are opt-in). ``None`` = key missing/malformed ("nothing
     enabled yet"; the first ``migrate_config`` run grandfathers installed user plugins); ``set()`` = explicitly
-    empty; else the allow-list."""
+    empty; else the allow-list. Raw-file read for the same reason as ``_get_disabled_plugins``."""
     try:
-        from hermes_cli.config import load_config
-        enabled = cfg_get(load_config(), "plugins", "enabled")
+        from hermes_cli.config import read_raw_config_readonly
+        enabled = cfg_get(read_raw_config_readonly() or {}, "plugins", "enabled")
         return set(enabled) if isinstance(enabled, list) else None
     except Exception:
         return None
@@ -255,7 +258,7 @@ class ManifestGate:
     log: Optional[tuple] = None  # (level, message, *args)
 
 
-IN_BOTH_LISTS = "listed in both plugins.enabled and plugins.disabled — disabled wins"
+IN_BOTH_LISTS = "listed in both plugins.enabled and plugins.disabled"
 
 
 def plugins_in_both_lists() -> list[str]:
@@ -289,13 +292,14 @@ def gate_manifest(
         return _placeholder(error, logging.WARNING, "Refusing to load removed Hermes Relay plugin '%s'; %s", error)
     if names & disabled:
         if enabled and names & enabled:
-            # Contradictory config (#131980): the disable wins, but a silent DEBUG skip hides the
-            # conflict — the plugin "loads nowhere" while plugins.enabled still lists it. Fail loud.
+            # Contradictory config (#131980): membership is exclusive, nothing wins. Every config
+            # read refuses the file (friendly at boot via require_parseable_user_config, raise in
+            # load_config()); this ERROR is the loader's backstop under --ignore-user-config,
+            # where the lists still load, so the state can never resolve silently.
             return _placeholder(
                 IN_BOTH_LISTS,
-                logging.WARNING,
-                "Plugin '%s' is listed in both plugins.enabled and plugins.disabled; the disable "
-                "wins and it will not load — remove it from one of the two lists",
+                logging.ERROR,
+                "Plugin '%s' is listed in both plugins.enabled and plugins.disabled; remove it from one list",
             )
         return _placeholder("disabled via config", logging.DEBUG, "Skipping disabled plugin '%s'")
     # Exclusive plugins (memory providers) have their own activation path; record only.

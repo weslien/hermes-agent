@@ -681,9 +681,9 @@ class TestBundledDiscovery:
         assert loaded.error and "not enabled" in loaded.error
 
 
-    def test_disabled_beats_enabled(self, _isolate_env):
-        """plugins.disabled wins even if the plugin is also in plugins.enabled — and the
-        contradiction is surfaced (#131980), not absorbed as a plain disable."""
+    def test_in_both_lists_fails_validation(self, _isolate_env):
+        """Membership is exclusive: a plugin in both lists fails validation (#131980) — surfaced
+        as the loader's IN_BOTH_LISTS error, not absorbed as a plain disable."""
         import hermes_yaml as yaml
         cfg_path = _isolate_env / "config.yaml"
         cfg_path.write_text(yaml.safe_dump({
@@ -693,11 +693,12 @@ class TestBundledDiscovery:
             }
         }))
         from hermes_cli import plugins as pmod
+        from hermes_cli.plugins_discovery import IN_BOTH_LISTS
         mgr = pmod.PluginManager()
         mgr.discover_and_load()
         loaded = mgr._plugins["disk-cleanup"]
         assert not loaded.enabled
-        assert loaded.error == "listed in both plugins.enabled and plugins.disabled — disabled wins"
+        assert loaded.error == IN_BOTH_LISTS
 
     def test_memory_and_context_engine_subdirs_skipped(self, _isolate_env):
         """Bundled scan must NOT pick up plugins/memory or plugins/context_engine

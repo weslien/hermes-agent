@@ -146,7 +146,7 @@ def test_a_secondary_whose_credentials_come_from_its_secret_scope_uses_yuanbao(t
 
 @pytest.mark.parametrize("name", ["platforms/yuanbao", "yuanbao-platform"])
 def test_plugins_disabled_naming_the_bundled_adapter_is_not_use_and_still_disables_the_plugin(tmp_path, name):
-    from hermes_cli.plugins_discovery import gate_manifest
+    from hermes_cli.plugins_discovery import IN_BOTH_LISTS, gate_manifest
     from hermes_cli.plugins_manifest import PluginManifest
     home = _home(tmp_path, env="YUANBAO_APP_ID=a\nYUANBAO_APP_SECRET=s\n",
                  config=f"plugins:\n  disabled: [{name}]\n")
@@ -154,9 +154,9 @@ def test_plugins_disabled_naming_the_bundled_adapter_is_not_use_and_still_disabl
     manifest = PluginManifest(name="yuanbao", source="user", path=str(home / "plugins" / "yuanbao"), key="yuanbao")
     assert gate_manifest(manifest, {name}, None).error == "disabled via config"
     assert lcm.legacy_plugin_alias(name) == "yuanbao"  # `hermes plugins <verb> <name>` names the catalog plugin
-    # Installed and enabled (before the update, or by hand): core's old disable still wins.
-    assert gate_manifest(manifest, {name}, {"yuanbao"}).error == \
-        "listed in both plugins.enabled and plugins.disabled — disabled wins"
+    # Installed and enabled (before the update, or by hand): the dual listing fails
+    # validation — membership is exclusive, nothing wins.
+    assert gate_manifest(manifest, {name}, {"yuanbao"}).error == IN_BOTH_LISTS
 
 
 def test_a_bare_yuanbao_in_plugins_disabled_is_still_use(tmp_path):

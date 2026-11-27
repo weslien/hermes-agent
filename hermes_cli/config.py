@@ -455,6 +455,24 @@ def require_parseable_user_config(*, ignore_user_config: bool = False) -> None:
         parse_error = exc
     else:
         if data is None or isinstance(data, dict):
+            from hermes_cli.config_value_checks import exclusive_membership_findings
+            # Every exclusive-membership section fails the run, so a pair key added to the
+            # mapping is gated here automatically — load_config() refuses the same raw state
+            # for every direct read too (see _reject_contradictory_membership_lists).
+            # shortcut: hard gates judge the raw user file; `plugins validate` catches the
+            # refusal in its report and also scans the merged config, so a managed pin vs a
+            # user entry reaches it only; revisit when managed pair-key pins exist.
+            findings = exclusive_membership_findings(data) if isinstance(data, dict) else []
+            if findings:
+                # Membership in enabled/disabled lists is exclusive: the run refuses, it
+                # never silently prefers one side (#131980 follow-up).
+                message = (
+                    f"Hermes stopped because your settings file ({config_path}) is contradictory: "
+                    + "; ".join(findings)
+                    + ". Fix it with `hermes config edit`, or add --ignore-user-config to run "
+                    "once with default settings.")
+                logger.error(message)
+                raise InvalidUserConfigError(message)
             return
         parse_error = TypeError(f"top-level YAML value must be a mapping, got {type(data).__name__}")
 
@@ -470,6 +488,23 @@ def require_parseable_user_config(*, ignore_user_config: bool = False) -> None:
     message += f" Details: {_yaml_error_details(parse_error)}"
     logger.error(message)
     raise InvalidUserConfigError(message) from parse_error
+
+
+def _reject_contradictory_membership_lists(user_config: dict[str, Any]) -> None:
+    """Every config read refuses a name in both an enabled and a disabled list (#131980 follow-up):
+    membership is exclusive, nothing wins. Boot surfaces print the friendly message via
+    ``require_parseable_user_config``; direct ``load_config()``/``load_config_readonly()`` callers
+    get this raise. ``--ignore-user-config`` / HERMES_IGNORE_USER_CONFIG=1 keep the rescue path
+    usable, and the discovery getters keep reading the raw file so the loader's ERROR backstop
+    still has the conflict to report."""
+    if os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1":
+        return
+    from hermes_cli.config_value_checks import exclusive_membership_findings
+    findings = exclusive_membership_findings(user_config)
+    if findings:
+        message = "; ".join(findings)
+        logger.error(message)
+        raise InvalidUserConfigError(message)
 
 
 def get_env_path() -> Path:
@@ -1064,7 +1099,7 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
             return [config_load_issue(exc)]
 
     from hermes_cli.config_value_checks import (
-        _validate_quoted_containers, _validate_timezone, _validate_voice)
+        _validate_exclusive_membership, _validate_quoted_containers, _validate_timezone, _validate_voice)
     issues: list[ConfigIssue] = []
     _validate_voice(config, issues)
     _validate_timezone(config, issues)
@@ -1094,6 +1129,7 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
                    f"Move '{key}' under the appropriate section")
 
     _validate_quoted_containers(config, issues)
+    _validate_exclusive_membership(config, issues)
     return issues
 
 
@@ -2158,11 +2194,16 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
                 config = _deep_merge(config, user_config)
                 from hermes_cli.moa_config import apply_user_moa_presets
                 apply_user_moa_presets(config, user_config)
+                _reject_contradictory_membership_lists(user_config)
                 # A copy of the file that just parsed is what a FRESH process falls back to when the
                 # next edit breaks the YAML (see _last_known_good_fallback). backup_config() skips
                 # byte-identical repeats and keeps a bounded count, so steady-state loads cost one stat.
                 from hermes_cli.config_backups import backup_config
                 backup_config(config_path, "good")
+            except InvalidUserConfigError:
+                # Contradictory enabled/disabled lists are a validation refusal, not a read
+                # failure: never stand last-known-good or defaults in their place (#131980).
+                raise
             except Exception as e:
                 lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e)
                 if lkg_copy is not None:

@@ -897,7 +897,7 @@ def cmd_validate(path: str, as_json: bool = False, install_deps: bool = False) -
                 probe = (venv_command(root, selected_venv(root)), activation_environment(root))
         except Exception as exc:  # validation still runs; the probe reports what is missing
             print(f"dependency preparation failed: {exc}", file=sys.stderr)
-    report = validate_plugin_dir(Path(path), probe)
+    report = validate_plugin_dir(Path(path), probe)  # engine also reports config exclusivity rows
     if as_json:
         print(json.dumps(report.to_dict(), indent=2))
         sys.exit(report.exit_code)

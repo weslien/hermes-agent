@@ -7,8 +7,8 @@ import os
 import subprocess
 from pathlib import Path
 from hermes_cli.doctor_report import (
-    Finding, _fail_and_issue, _section, check_bool, check_info, check_ok, check_warn, doctor_check, ensure_dir,
-    warn_on_error,
+    Finding, _fail_and_issue, _section, check_bool, check_fail, check_info, check_ok, check_warn, doctor_check,
+    ensure_dir, warn_on_error,
 )
 from hermes_cli.sizefmt import format_bytes as _human_bytes
 from hermes_platform.resolver.git import resolve_usable_git
@@ -659,18 +659,18 @@ def _check_plugins_disabled_by_update(should_fix: bool, f: Finding) -> None:
 
 @doctor_check("")  # best-effort: an unreadable config is the config check's finding
 def _check_plugins_in_both_lists(should_fix: bool, f: Finding) -> None:
-    """A plugin in both plugins.enabled and plugins.disabled loads nowhere (the disable wins). Older
-    updates left plugins in that state when they had to turn them off. Judged by the loader's gate."""
+    """A plugin in both plugins.enabled and plugins.disabled is a config validation failure
+    (#131980 follow-up): membership is exclusive, nothing wins. Older updates left plugins in
+    that state when they had to turn them off. Judged by the loader's gate."""
     from hermes_cli.plugins_discovery import plugins_in_both_lists
+    from hermes_cli.config_value_checks import exclusive_membership_error
     both = plugins_in_both_lists()
     if not both:
         return
     _section("Plugins Listed as Both Enabled and Disabled")
     for name in both:
-        check_warn(f"{name} will not load", "(plugins.disabled wins)")
-        f.manual_issues.append(f"Plugin '{name}' is in both plugins.enabled and plugins.disabled, so it is off. "
-                               f"Turn it on with `hermes plugins enable {name}` (a memory provider also needs "
-                               f"memory.provider set), or keep it off with `hermes plugins disable {name}`")
+        check_fail(f"{name} fails validation", "(listed in both plugins.enabled and plugins.disabled)")
+        f.manual_issues.append(exclusive_membership_error(name))
 
 
 @doctor_check("")  # best-effort: profile enumeration must never break doctor
